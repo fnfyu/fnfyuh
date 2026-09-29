@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="fnfyu harness 工作台" />
+    <title>fnfyu harness · 工作台</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">跳转到对话区</a>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-lockup">
+          <span class="brand-mark" aria-hidden="true">FH</span>
+          <h1>工作台</h1>
+        </div>
+        <div class="topbar-actions">
+          <div class="connection-state" role="status" aria-live="polite">
+            <span class="status-dot" id="connection-dot"></span>
+            <span id="connection-label">离线</span>
+          </div>
+          <button class="button quiet header-action" id="settings-button" type="button" aria-haspopup="dialog">设置</button>
+        </div>
+      </header>
+
+      <main id="main" class="workspace" tabindex="-1">
+        <div class="workspace-grid">
+          <aside class="history-panel card" aria-label="会话历史">
+            <div class="history-heading">
+              <h3>会话</h3>
+              <button class="button primary compact-button" id="new-session-button" type="button">新建</button>
+            </div>
+            <label class="visually-hidden" for="session-search">搜索会话</label>
+            <div class="search-field">
+              <span aria-hidden="true">⌕</span>
+              <input id="session-search" type="search" placeholder="搜索" autocomplete="off" />
+            </div>
+            <div class="history-filters" aria-label="会话筛选">
+              <button class="filter-button is-active" type="button" aria-pressed="true" data-history-filter="active">活跃</button>
+              <button class="filter-button" type="button" aria-pressed="false" data-history-filter="all">全部</button>
+              <button class="filter-button" type="button" aria-pressed="false" data-history-filter="archived">归档</button>
+            </div>
+            <div class="session-list" id="session-list" aria-live="polite">
+              <div class="history-empty">
+                <span class="empty-glyph" aria-hidden="true">+</span>
+                <strong>暂无会话</strong>
+              </div>
+            </div>
+            <div class="history-footer">
+              <span class="visually-hidden" id="session-count">0 个会话</span>
+              <button class="button quiet compact-button refresh-button" id="refresh-sessions-button" type="button" aria-label="刷新会话">↻</button>
+            </div>
+          </aside>
+
+          <section class="main-column" aria-label="主对话区">
+            <section class="card conversation-card">
+              <header class="conversation-heading">
+                <div class="conversation-title">
+                  <h3 id="conversation-title">选择会话</h3>
+                  <p class="session-subtitle" id="session-id"></p>
+                </div>
+                <div class="conversation-status">
+                  <span class="pill neutral" id="model-pill">gpt-5.4</span>
+                  <span class="pill neutral" id="turn-state" role="status" aria-live="polite">空闲</span>
+                </div>
+              </header>
+              <div class="conversation" id="conversation" aria-live="polite">
+                <div class="empty-state">
+                  <span class="empty-glyph large" aria-hidden="true">↗</span>
+                  <strong>选择会话</strong>
+                </div>
+              </div>
+              <form id="turn-form" class="composer">
+                <div class="drop-zone" id="drop-zone" aria-describedby="drop-help">
+                  <div class="drop-zone-mark" aria-hidden="true">＋</div>
+                  <div class="drop-zone-copy">
+                    <strong>拖放或粘贴文件</strong>
+                    <span id="drop-help">支持文本和图片</span>
+                  </div>
+                  <button class="button quiet compact-button" id="pick-files-button" type="button">选择</button>
+                  <input id="file-input" type="file" multiple hidden />
+                </div>
+                <div class="attachment-strip" id="composer-attachments" aria-live="polite"></div>
+                <details class="turn-options" id="turn-options">
+                  <summary>本回合参数 <span class="turn-options-summary" id="turn-options-summary" aria-live="polite">自动</span></summary>
+                  <div class="turn-options-panel">
+                    <div class="turn-options-grid">
+                      <div class="parameter-field">
+                        <label for="thinking-effort">思考强度</label>
+                        <select id="thinking-effort" aria-describedby="thinking-effort-help">
+                          <option value="">自动</option>
+                          <option value="off">关闭</option>
+                          <option value="minimal">极低</option>
+                          <option value="low">低</option>
+                          <option value="medium">中</option>
+                          <option value="high">高</option>
+                          <option value="xhigh">极高</option>
+                          <option value="max">最大</option>
+                        </select>
+                        <span class="helper" id="thinking-effort-help">由模型决定时使用“自动”。</span>
+                      </div>
+                      <div class="parameter-field">
+                        <label for="temperature">温度</label>
+                        <input id="temperature" type="number" min="0" max="2" step="0.1" inputmode="decimal" placeholder="默认" aria-describedby="temperature-help" />
+                        <span class="helper" id="temperature-help">留空表示默认值；Anthropic 模型范围为 0–1。</span>
+                      </div>
+                      <div class="parameter-field">
+                        <label for="max-output-tokens">最大输出 tokens</label>
+                        <input id="max-output-tokens" type="number" min="16" max="131072" step="1" inputmode="numeric" placeholder="默认" aria-describedby="max-output-tokens-help" />
+                        <span class="helper" id="max-output-tokens-help">限制单次回答长度；开启思考时会为思考预算扩展总额度。</span>
+                      </div>
+                    </div>
+                    <div class="turn-options-footer">
+                      <span class="helper">参数会保存在本浏览器，并应用到后续回合；模型不支持时可能忽略或拒绝。</span>
+                      <button class="button quiet compact-button" id="reset-turn-parameters" type="button">恢复默认</button>
+                    </div>
+                  </div>
+                </details>
+                <label class="visually-hidden" for="turn-content">消息</label>
+                <textarea id="turn-content" name="turn-content" rows="4" placeholder="输入消息…" disabled></textarea>
+                <div class="composer-footer">
+                  <div class="composer-hints">
+                    <span class="helper">Ctrl / ⌘ + Enter</span>
+                    <span class="helper secure-note">写入需确认</span>
+                  </div>
+                  <button class="button primary send-button" type="submit" disabled id="send-button">发送</button>
+                </div>
+              </form>
+            </section>
+          </section>
+        </div>
+
+        <details class="utility-drawer">
+            <summary>详情</summary>
+            <div class="utility-grid" aria-label="会话详情">
+              <section class="utility-section" aria-label="附件">
+                <div class="section-heading compact-heading">
+                  <h3>附件</h3>
+                  <span class="pill neutral" id="artifact-count">0</span>
+                </div>
+                <p class="helper artifact-note">仅当前会话</p>
+                <div class="artifact-list" id="artifact-list" aria-live="polite">
+                  <p class="timeline-empty">暂无附件</p>
+                </div>
+              </section>
+
+              <section class="utility-section" aria-label="工具">
+                <div class="section-heading compact-heading">
+                  <h3>工具</h3>
+                  <span class="pill neutral" id="tool-count">0</span>
+                </div>
+                <div class="tool-queue" id="tool-queue" aria-live="polite">
+                  <p class="timeline-empty">暂无请求</p>
+                </div>
+              </section>
+
+              <section class="utility-section" aria-label="操作">
+                <div class="section-heading compact-heading">
+                  <h3>操作</h3>
+                  <span class="icon-badge" aria-hidden="true">↻</span>
+                </div>
+                <form id="inspect-form">
+                  <label for="operation-id">操作 ID</label>
+                  <input id="operation-id" name="operation-id" placeholder="操作 ID" autocomplete="off" />
+                  <div class="button-row">
+                    <button class="button secondary" type="submit">检查</button>
+                    <button class="button quiet" id="continue-button" type="button" disabled>继续</button>
+                  </div>
+                </form>
+                <pre class="result-block" id="operation-result" aria-live="polite">暂无结果</pre>
+              </section>
+
+              <section class="utility-section" aria-label="事件">
+                <div class="section-heading compact-heading">
+                  <h3>事件</h3>
+                  <span class="pill neutral" id="event-count">0</span>
+                </div>
+                <ol class="timeline" id="timeline" aria-live="polite">
+                  <li class="timeline-empty">暂无事件</li>
+                </ol>
+              </section>
+            </div>
+        </details>
+      </main>
+    </div>
+
+    <dialog class="modal-dialog session-dialog" id="session-dialog" aria-labelledby="session-dialog-title">
+      <form class="modal-panel" id="create-form" method="dialog">
+        <div class="modal-heading">
+          <h2 id="session-dialog-title">新建会话</h2>
+          <button class="button quiet" id="session-dialog-close" type="button" aria-label="关闭新建会话">关闭</button>
+        </div>
+        <p class="modal-note">工具仅可访问此目录；上传文件先留在会话。</p>
+        <label for="workspace-root">工作区</label>
+        <input id="workspace-root" name="workspace-root" value="." autocomplete="off" />
+        <label for="model-name">模型</label>
+        <select id="model-name" name="model-name" aria-describedby="model-help">
+          <option value="gpt-5.4">GPT-5.4 · Codex</option>
+        </select>
+        <p class="helper" id="model-help">图片附件需选择支持视觉的模型。</p>
+        <div class="modal-footer">
+          <button class="button quiet" id="session-dialog-cancel" type="button">取消</button>
+          <button class="button primary" type="submit">创建会话</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="modal-dialog save-dialog" id="workspace-save-dialog" aria-labelledby="save-dialog-title">
+      <form class="modal-panel" id="workspace-save-form" method="dialog">
+        <div class="modal-heading">
+          <h2 id="save-dialog-title">保存到工作区</h2>
+          <button class="button quiet" id="workspace-save-close" type="button" aria-label="关闭保存对话框">关闭</button>
+        </div>
+        <p class="modal-note warning-note">确认后才会写入工作区。</p>
+        <label for="workspace-save-path">目标路径（相对工作区）</label>
+        <input id="workspace-save-path" name="workspace-save-path" autocomplete="off" aria-describedby="workspace-save-help" />
+        <input id="workspace-save-artifact-id" type="hidden" />
+        <p class="helper" id="workspace-save-help">必须位于工作区内。</p>
+        <div class="modal-footer">
+          <button class="button quiet" id="workspace-save-cancel" type="button">取消</button>
+          <button class="button primary" type="submit">写入</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="modal-dialog media-preview-dialog" id="media-preview-dialog" aria-labelledby="media-preview-title">
+      <form class="media-preview-panel" method="dialog">
+        <div class="modal-heading">
+          <h2 id="media-preview-title">图片预览</h2>
+          <button class="button quiet" id="media-preview-close" type="submit" aria-label="关闭图片预览">关闭</button>
+        </div>
+        <img id="media-preview-image" class="media-preview-image" alt="" decoding="async" />
+        <p class="helper" id="media-preview-meta"></p>
+      </form>
+    </dialog>
+
+    <dialog class="settings-dialog" id="settings-dialog" aria-labelledby="settings-title">
+      <form class="settings-panel" id="settings-form" method="dialog">
+        <div class="settings-heading">
+          <h2 id="settings-title">设置</h2>
+          <button class="button quiet" id="settings-close" type="button" aria-label="关闭设置">关闭</button>
+        </div>
+        <p class="settings-note">Secret 只保存引用，不保存密钥。凭据从环境变量或本地 OAuth 读取。</p>
+        <div class="settings-layout">
+          <section class="settings-list-section" aria-labelledby="provider-list-title">
+            <div class="section-heading compact-heading">
+              <h3 id="provider-list-title">供应商</h3>
+              <span class="pill neutral" id="provider-count">0</span>
+            </div>
+            <label for="default-model">默认模型</label>
+            <select id="default-model" name="default-model"></select>
+            <div class="provider-list" id="provider-list" aria-live="polite">
+              <p class="timeline-empty">读取中…</p>
+            </div>
+          </section>
+          <section class="settings-editor" aria-labelledby="provider-editor-title">
+            <div class="section-heading compact-heading">
+              <h3 id="provider-editor-title">添加供应商</h3>
+            </div>
+            <label for="provider-id">ID</label>
+            <input id="provider-id" name="provider-id" placeholder="如 deepseek" autocomplete="off" />
+            <label for="provider-name">名称</label>
+            <input id="provider-name" name="provider-name" placeholder="如 DeepSeek" autocomplete="off" />
+            <label for="provider-kind">协议</label>
+            <select id="provider-kind" name="provider-kind">
+              <option value="open_ai_compatible">OpenAI-compatible</option>
+              <option value="anthropic">Anthropic Messages</option>
+              <option value="openai_codex">Codex OAuth</option>
+            </select>
+            <label id="provider-endpoint-label" for="provider-endpoint">接口地址</label>
+            <input id="provider-endpoint" name="provider-endpoint" placeholder="https://…" autocomplete="off" />
+            <label id="provider-key-env-label" for="provider-key-env">Secret 环境变量</label>
+            <input id="provider-key-env" name="provider-key-env" placeholder="如 DEEPSEEK_API_KEY" autocomplete="off" />
+            <label for="provider-model-id">模型 ID</label>
+            <input id="provider-model-id" name="provider-model-id" placeholder="如 deepseek-chat" autocomplete="off" />
+            <div class="button-row">
+              <button class="button quiet" id="discover-provider-models-button" type="button">从供应商获取模型</button>
+              <select id="provider-model-catalog" aria-label="供应商模型列表" hidden></select>
+            </div>
+            <span class="helper" id="provider-model-discovery-status" role="status" aria-live="polite"></span>
+            <label for="provider-model-label">模型名称</label>
+            <input id="provider-model-label" name="provider-model-label" placeholder="如 DeepSeek Chat" autocomplete="off" />
+            <label class="checkbox-label" for="provider-model-vision">
+              <input id="provider-model-vision" name="provider-model-vision" type="checkbox" />
+              支持图片
+            </label>
+            <button class="button secondary" id="add-provider-button" type="button">添加</button>
+            <div class="codex-auth-panel" id="codex-auth-panel" hidden>
+              <div class="codex-auth-heading"><strong>Codex 授权</strong><span class="pill neutral" id="codex-auth-status">未登录</span></div>
+              <p class="helper">使用 OpenAI OAuth，凭据保存在本地。授权页遇到 Cloudflare 403 时，可尝试设备码登录（仍受 OpenAI 地区限制）。</p>
+              <p class="helper codex-auth-error" id="codex-auth-error" role="alert" hidden></p>
+              <a id="codex-auth-url" class="codex-auth-link" href="#" target="_blank" rel="noopener noreferrer" hidden>打开授权页面</a>
+              <div class="codex-device-code-row" id="codex-device-code-row" hidden>
+                <code id="codex-device-code"></code>
+                <button class="button quiet" id="codex-copy-device-code" type="button">复制设备码</button>
+              </div>
+              <div class="button-row">
+                <button class="button secondary" id="codex-login-button" type="button">浏览器登录</button>
+                <button class="button quiet" id="codex-device-login-button" type="button">设备码登录</button>
+                <button class="button quiet" id="codex-logout-button" type="button">退出</button>
+              </div>
+            </div>
+          </section>
+        </div>
+        <div class="settings-footer">
+          <span class="helper" id="settings-status" role="status" aria-live="polite">未保存</span>
+          <div class="button-row">
+            <button class="button quiet" id="settings-cancel" type="button">取消</button>
+            <button class="button primary" id="save-settings-button" type="submit">保存</button>
+          </div>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script type="module" src="/app.mjs"></script>
+  </body>
+</html>

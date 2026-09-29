@@ -1,0 +1,84 @@
+services:
+  harnessd:
+    build:
+      context: .
+      target: runtime
+      args:
+        NODE_VERSION: ${NODE_VERSION:-22.22.2}
+        RUST_VERSION: ${RUST_VERSION:-1.85.1}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+        CARGO_MIRROR: ${CARGO_MIRROR:-sparse+https://rsproxy.cn/index/}
+    image: ${FNFYU_HARNESS_IMAGE:-local-first-harness:dev}
+    environment:
+      HARNESS_DB: /data/events.sqlite
+      HARNESS_SETTINGS: /data/fnfyuh-settings.json
+      HARNESS_EXECUTION_BACKEND: ${HARNESS_EXECUTION_BACKEND:-local-trusted-host}
+      HARNESS_CONTAINER_RUNTIME: ${HARNESS_CONTAINER_RUNTIME:-docker}
+      HARNESS_CONTAINER_IMAGE: ${HARNESS_CONTAINER_IMAGE:-node:22-bookworm-slim}
+      HARNESS_CONTAINER_ISOLATION: ${HARNESS_CONTAINER_ISOLATION:-container}
+      HARNESS_MODEL: ${HARNESS_MODEL:-echo}
+      HARNESS_MODEL_ENDPOINT: ${HARNESS_MODEL_ENDPOINT:-}
+      HARNESS_MODEL_API_KEY: ${HARNESS_MODEL_API_KEY:-}
+      HARNESS_MODEL_TIMEOUT_MS: ${HARNESS_MODEL_TIMEOUT_MS:-120000}
+      HARNESS_CODEX_BRIDGE: /app/apps/gateway/codex-bridge.mjs
+      HARNESS_CODEX_OAUTH_FILE: /data/openai-codex-oauth.json
+      PI_OAUTH_CALLBACK_HOST: 0.0.0.0
+    volumes:
+      - harness-data:/data
+      - ${HARNESS_WORKSPACE:-.}:/workspace
+    working_dir: /workspace
+    stdin_open: true
+    tty: false
+
+  gateway:
+    image: ${FNFYU_HARNESS_IMAGE:-local-first-harness:dev}
+    profiles: ["web"]
+    # Host networking lets the container reach the host's loopback proxy and
+    # exposes the OAuth callback on the same localhost:1455 the browser uses.
+    network_mode: host
+    environment:
+      HARNESSD: /usr/local/bin/harnessd
+      HARNESS_DB: /data/events.sqlite
+      HARNESS_SETTINGS: /data/fnfyuh-settings.json
+      HARNESS_EXECUTION_BACKEND: ${HARNESS_EXECUTION_BACKEND:-local-trusted-host}
+      HARNESS_CONTAINER_RUNTIME: ${HARNESS_CONTAINER_RUNTIME:-docker}
+      HARNESS_CONTAINER_IMAGE: ${HARNESS_CONTAINER_IMAGE:-node:22-bookworm-slim}
+      HARNESS_CONTAINER_ISOLATION: ${HARNESS_CONTAINER_ISOLATION:-container}
+      HARNESS_MODEL: ${HARNESS_MODEL:-echo}
+      HARNESS_MODEL_ENDPOINT: ${HARNESS_MODEL_ENDPOINT:-}
+      HARNESS_MODEL_API_KEY: ${HARNESS_MODEL_API_KEY:-}
+      HARNESS_MODEL_TIMEOUT_MS: ${HARNESS_MODEL_TIMEOUT_MS:-120000}
+      HARNESS_CODEX_BRIDGE: /app/apps/gateway/codex-bridge.mjs
+      HARNESS_CODEX_OAUTH_FILE: /data/openai-codex-oauth.json
+      PI_OAUTH_CALLBACK_HOST: 0.0.0.0
+      HARNESS_GATEWAY_HOST: 0.0.0.0
+      HARNESS_GATEWAY_PORT: 8787
+      HARNESS_GATEWAY_TOKEN: ${HARNESS_GATEWAY_TOKEN:-}
+      NODE_USE_ENV_PROXY: ${NODE_USE_ENV_PROXY:-1}
+      HTTP_PROXY: ${HARNESS_HTTP_PROXY:-}
+      HTTPS_PROXY: ${HARNESS_HTTPS_PROXY:-}
+      ALL_PROXY: ${HARNESS_ALL_PROXY:-}
+      NO_PROXY: ${HARNESS_NO_PROXY:-localhost,127.0.0.1,::1}
+    volumes:
+      - harness-data:/data
+      - ${HARNESS_WORKSPACE:-.}:/workspace
+      - ${HARNESS_PROJECT_ROOT:-.}:/app:ro
+      - /app/node_modules
+    working_dir: /workspace
+    entrypoint: ["node", "/app/apps/gateway/server.mjs"]
+
+  cli:
+    image: ${FNFYU_HARNESS_IMAGE:-local-first-harness:dev}
+    profiles: ["cli"]
+    environment:
+      HARNESS_DB: /data/events.sqlite
+      HARNESS_SETTINGS: /data/fnfyuh-settings.json
+      HARNESSD: /usr/local/bin/harnessd
+    volumes:
+      - harness-data:/data
+      - ${HARNESS_WORKSPACE:-.}:/workspace
+    working_dir: /workspace
+    entrypoint: ["node", "/app/apps/cli/index.mjs"]
+
+volumes:
+  harness-data:

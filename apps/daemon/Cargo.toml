@@ -1,0 +1,21 @@
+[package]
+name = "harness-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "harnessd"
+path = "src/main.rs"
+
+[dependencies]
+harness-agent-runtime = { path = "../../crates/agent-runtime" }
+harness-execution-broker = { path = "../../crates/execution-broker" }
+harness-policy-engine = { path = "../../crates/policy-engine" }
+harness-prompt-compiler = { path = "../../crates/prompt-compiler" }
+harness-protocol = { path = "../../crates/protocol" }
+harness-session-engine = { path = "../../crates/session-engine" }
+harness-settings = { path = "../../crates/settings" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true

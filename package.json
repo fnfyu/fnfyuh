@@ -1,0 +1,30 @@
+{
+  "name": "local-first-harness",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "fnfyuh": "apps/cli/fnfyuh.mjs"
+  },
+  "scripts": {
+    "test": "node --test sdk/test/*.test.mjs",
+    "fnfyuh": "node apps/cli/fnfyuh.mjs",
+    "dsh": "node apps/cli/dsh.mjs",
+    "test:protocol": "node --test sdk/test/protocol.test.mjs",
+    "build:sdk": "tsc -p tsconfig.json",
+    "cli": "node apps/cli/index.mjs",
+    "gateway": "node apps/gateway/server.mjs",
+    "ide": "node apps/ide/client.mjs",
+    "web:smoke": "node --input-type=module -e \"const fs = await import('node:fs/promises'); for (const file of ['apps/web/index.html','apps/web/app.mjs','apps/web/styles.css','sdk/src/browser.mjs']) await fs.access(file); console.log('web assets ok')\"",
+    "docker:build": "docker compose build --pull harnessd",
+    "docker:verify": "bash scripts/wsl-docker-verify.sh",
+    "check:format": "git diff --check"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "^0.85.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2"
+  }
+}

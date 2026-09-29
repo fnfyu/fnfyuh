@@ -1,0 +1,15 @@
+.git
+.gitignore
+.runtime
+*.sqlite
+*.sqlite3
+*.db
+node_modules
+dist
+target
+coverage
+.pnpm-store
+.DS_Store
+.env
+.env.*
+!.env.example
