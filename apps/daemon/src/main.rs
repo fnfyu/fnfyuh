@@ -1,16 +1,16 @@
 use harness_agent_runtime::{
     AgentRuntime, AnthropicProvider, CodexOAuthProvider, ModelAttachment, ModelProvider,
-    ModelRequest, ModelResponse, OpenAiCompatibleProvider, ToolCoordinator,
+    ModelRequest, ModelResponse, OpenAiCompatibleProvider, ToolCoordinator, TurnCancellation,
 };
 use harness_execution_broker::{
     ApprovalGrant, ContainerBackendConfig, ExecutionAdapter, ExecutionBroker,
     LocalRestrictedBackend, UnavailableContainerBackend,
 };
-use harness_policy_engine::{PolicyConfig, PolicyEngine};
+use harness_policy_engine::{ApprovalMode, PolicyConfig, PolicyEngine};
 use harness_prompt_compiler::{compile, PromptLayers, ToolDefinition};
 use harness_protocol::{
     canonical_json, event_notification, now_ms, EventEnvelope, JsonRpcRequest, JsonRpcResponse,
-    ModelParameters, RpcId,
+    EventPayload, ModelParameters, RpcId, ToolStatus,
 };
 use harness_session_engine::{
     CommandClaim, CommandHead, CommandReceipt, CommandState, PureCommandResult, SessionEngine,
@@ -23,7 +23,8 @@ use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 
 const JSON_RPC_INVALID_REQUEST: i32 = -32600;
 const JSON_RPC_METHOD_NOT_FOUND: i32 = -32601;
@@ -154,6 +155,14 @@ struct TurnStartParams {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TurnStopParams {
+    session_id: String,
+    turn_id: String,
+    run_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct PromptParams {
     session_id: String,
     layers: Option<PromptLayers>,
@@ -276,6 +285,11 @@ fn default_tools() -> Vec<ToolDefinition> {
             input_schema: r#"{"type":"object","required":["program","args"],"properties":{"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"cwd":{"type":"string"},"timeout_ms":{"type":"integer"}}}"#.into(),
         },
         ToolDefinition {
+            name: "test".into(),
+            description: "Run tests with an allowlisted absolute program without a shell.".into(),
+            input_schema: r#"{"type":"object","required":["program","args"],"properties":{"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"cwd":{"type":"string"},"timeout_ms":{"type":"integer"}}}"#.into(),
+        },
+        ToolDefinition {
             name: "git".into(),
             description: "Run a typed git argument vector.".into(),
             input_schema: r#"{"type":"object","required":["args"],"properties":{"args":{"type":"array","items":{"type":"string"}},"cwd":{"type":"string"}}}"#.into(),
@@ -390,11 +404,40 @@ fn main() -> anyhow::Result<()> {
         });
     let settings = SettingsStore::new(settings_path);
     let config = DaemonConfig::from_env();
-    let stdin = io::stdin();
-    let mut stdout = io::BufWriter::new(io::stdout().lock());
+    let cancellation = Arc::new(TurnCancellation::default());
+    let stdout = Arc::new(Mutex::new(io::BufWriter::new(io::stdout())));
+    let (input_tx, input_rx) = mpsc::channel::<io::Result<String>>();
+    let reader_cancellation = cancellation.clone();
+    let reader_stdout = stdout.clone();
+    thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            match line {
+                Ok(line) => {
+                    if let Ok(request) = serde_json::from_str::<JsonRpcRequest>(&line) {
+                        if request.method == "runtime.v1.turn.stop" {
+                            let response = match (request.id, request.jsonrpc == "2.0", parse_params::<TurnStopParams>(&request.params)) {
+                                (Some(id), true, Ok(params)) if !params.session_id.is_empty() && !params.turn_id.is_empty() && params.run_id.as_deref() != Some("") => {
+                                    let accepted = reader_cancellation.request(&params.session_id, &params.turn_id, params.run_id.as_deref());
+                                    JsonRpcResponse::success(id, json!({"accepted": accepted, "stopped": false}))
+                                }
+                                (Some(id), true, _) => JsonRpcResponse::failure(id, JSON_RPC_INVALID_PARAMS, "stop requires session_id, turn_id and optional nonempty run_id"),
+                                (Some(id), false, _) => JsonRpcResponse::failure(id, JSON_RPC_INVALID_REQUEST, "jsonrpc must be 2.0"),
+                                (None, _, _) => continue,
+                            };
+                            if write_json(&mut *reader_stdout.lock().unwrap(), &response).is_err() { break; }
+                            continue;
+                        }
+                    }
+                    if input_tx.send(Ok(line)).is_err() { break; }
+                }
+                Err(error) => { let _ = input_tx.send(Err(error)); break; }
+            }
+        }
+    });
 
-    for line in stdin.lock().lines() {
+    for line in input_rx {
         let line = line?;
+        let mut stdout = SharedOutput(&stdout);
         if line.trim().is_empty() {
             continue;
         }
@@ -745,7 +788,9 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        match handle_request(&engine, &config, &settings, &request) {
+        let handled = handle_request(&engine, &config, &settings, &cancellation, &request);
+        cancellation.clear();
+        match handled {
             Ok((result, events)) => {
                 let result = if let Some(meta) = &command_meta {
                     let event_ids = events
@@ -786,6 +831,7 @@ fn handle_request(
     engine: &SessionEngine,
     config: &DaemonConfig,
     settings: &SettingsStore,
+    cancellation: &Arc<TurnCancellation>,
     request: &JsonRpcRequest,
 ) -> Result<(Value, Vec<EventEnvelope>), AppError> {
     match request.method.as_str() {
@@ -1025,12 +1071,13 @@ fn handle_request(
             let turn_id = params
                 .turn_id
                 .unwrap_or_else(|| format!("turn-{}", now_ms()));
+            cancellation.activate(&params.session_id, &turn_id);
             let runtime = AgentRuntime::new(
                 Arc::new(provider),
                 engine.clone(),
-                PromptLayers::default(),
+                project_layers(engine, &params.session_id)?,
                 default_tools(),
-            );
+            ).with_cancellation(cancellation.clone());
             let result = runtime.run_turn(
                 &params.session_id,
                 turn_id,
@@ -1038,7 +1085,7 @@ fn handle_request(
                 selected_model,
                 params.attachments,
                 params.parameters,
-            );
+            ).and_then(|response| drive_read_only(engine, config, settings, cancellation, &params.session_id, response));
             let after = engine.effective_events(&params.session_id)?;
             let events = after
                 .into_iter()
@@ -1091,6 +1138,8 @@ fn handle_request(
                 nonce: approval.nonce,
                 expires_at_ms: approval.expires_at_ms,
             });
+            cancellation.activate(&session_id, &turn_id);
+            cancellation.set_run_id(&run_id);
             let result = coordinator.execute(
                 &session_id,
                 &turn_id,
@@ -1101,18 +1150,82 @@ fn handle_request(
                 intent,
                 grant,
             );
+            let outcome = match result {
+                Ok(result) if matches!(&result.status, ToolStatus::Succeeded | ToolStatus::Failed) => {
+                    let response = if !engine.run_has_pending_operations(&session_id, &run_id)? {
+                        let projection = engine.replay(&session_id)?;
+                        let model_name = projection
+                            .model
+                            .or_else(|| env::var("HARNESS_MODEL").ok())
+                            .unwrap_or_default();
+                        // continue_run inherits the actual model and parameters from
+                        // the run's latest ModelRequested event; this lookup only
+                        // selects the configured provider implementation.
+                        let inherited_model = engine
+                            .effective_events(&session_id)?
+                            .into_iter()
+                            .rev()
+                            .find_map(|event| match event.payload {
+                                EventPayload::ModelRequested { run_id: event_run, model, .. }
+                                    if event_run == run_id => Some(model),
+                                _ => None,
+                            })
+                            .unwrap_or(model_name);
+                        let provider = configured_provider(settings, &inherited_model)?;
+                        let runtime = AgentRuntime::new(
+                            Arc::new(provider),
+                            engine.clone(),
+                            project_layers(engine, &session_id)?,
+                            default_tools(),
+                        ).with_cancellation(cancellation.clone());
+                        match runtime.continue_run(&session_id, &turn_id, &run_id)
+                            .and_then(|response| drive_read_only(engine, config, settings, cancellation, &session_id, response)) {
+                            Ok(response) => Some(response),
+                            Err(error) => {
+                                let after = engine.effective_events(&session_id)?;
+                                let events = after
+                                    .into_iter()
+                                    .filter(|event| {
+                                        !before.iter().any(|old| old.event_id == event.event_id)
+                                    })
+                                    .collect::<Vec<_>>();
+                                return Ok((
+                                    json!({
+                                        "accepted": false,
+                                        "result": result,
+                                        "error": error.to_string()
+                                    }),
+                                    events,
+                                ));
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    json!({ "accepted": true, "result": result, "response": response })
+                }
+                Ok(result) => {
+                    if !engine.run_has_pending_operations(&session_id, &run_id)? {
+                        engine.append(
+                            &session_id,
+                            EventPayload::RunCompleted {
+                                run_id: run_id.clone(),
+                                success: false,
+                            },
+                            Some(turn_id.clone()),
+                            None,
+                        )?;
+                    }
+                    json!({ "accepted": false, "result": result, "error": "tool execution did not succeed" })
+                }
+                Err(error) => json!({ "accepted": false, "error": error.to_string() }),
+            };
             let after = engine.effective_events(&session_id)?;
             let events = after
                 .into_iter()
                 .filter(|event| !before.iter().any(|old| old.event_id == event.event_id))
                 .collect::<Vec<_>>();
-            match result {
-                Ok(result) => Ok((json!({ "accepted": true, "result": result }), events)),
-                Err(error) => Ok((
-                    json!({ "accepted": false, "error": error.to_string() }),
-                    events,
-                )),
-            }
+            Ok((outcome, events))
         }
         "runtime.v1.session.recover" => {
             let params: RecoverParams = parse_params(&request.params)?;
@@ -1366,6 +1479,80 @@ fn handle_request(
     }
 }
 
+/// Drive only read-only proposals. Other proposals remain pending for the client to
+/// submit through tool.execute with an exact approval; never replay a terminal effect.
+fn drive_read_only(
+    engine: &SessionEngine,
+    config: &DaemonConfig,
+    settings: &SettingsStore,
+    cancellation: &Arc<TurnCancellation>,
+    session_id: &str,
+    mut response: ModelResponse,
+) -> Result<ModelResponse, harness_agent_runtime::AgentError> {
+    for _ in 0..32 {
+        if response.tools.is_empty() || response.tools.iter().any(|tool| !tool.intent.is_read_only()) {
+            return Ok(response);
+        }
+        let events = engine.effective_events(session_id)?;
+        let (turn_id, run_id) = events.iter().rev().find_map(|event| match &event.payload {
+            EventPayload::ModelResponded { turn_id, run_id, request_id, .. } if request_id == &response.request_id => Some((turn_id.clone(), run_id.clone())),
+            _ => None,
+        }).ok_or_else(|| harness_agent_runtime::AgentError::Model("model response has no recorded turn".into()))?;
+        check_stopped(engine, cancellation, session_id, &turn_id, &run_id)?;
+        let broker = build_broker(engine, config, session_id).map_err(|error| harness_agent_runtime::AgentError::Model(format!("cannot build execution broker: {error:?}")))?;
+        let coordinator = ToolCoordinator::new(engine.clone(), broker);
+        for tool in &response.tools {
+            check_stopped(engine, cancellation, session_id, &turn_id, &run_id)?;
+            coordinator.execute(session_id, &turn_id, &run_id, "agent", tool.operation_id.as_deref().ok_or_else(|| harness_agent_runtime::AgentError::Model("missing operation id".into()))?, &tool.tool_name, tool.intent.clone(), None)?;
+        }
+        check_stopped(engine, cancellation, session_id, &turn_id, &run_id)?;
+        let model = engine.effective_events(session_id)?.into_iter().rev().find_map(|event| match event.payload {
+            EventPayload::ModelRequested { run_id: event_run, model, .. } if event_run == run_id => Some(model),
+            _ => None,
+        }).ok_or_else(|| harness_agent_runtime::AgentError::Model("run has no model".into()))?;
+        let provider = configured_provider(settings, &model).map_err(|error| harness_agent_runtime::AgentError::Model(format!("cannot select provider: {error:?}")))?;
+        let layers = project_layers(engine, session_id).map_err(|error| harness_agent_runtime::AgentError::Model(format!("cannot load project rules: {error:?}")))?;
+        check_stopped(engine, cancellation, session_id, &turn_id, &run_id)?;
+        response = AgentRuntime::new(Arc::new(provider), engine.clone(), layers, default_tools())
+            .with_cancellation(cancellation.clone()).continue_run(session_id, &turn_id, &run_id)?;
+    }
+    Err(harness_agent_runtime::AgentError::Model("automatic read loop exceeded 32 steps".into()))
+}
+
+fn check_stopped(
+    engine: &SessionEngine,
+    cancellation: &TurnCancellation,
+    session_id: &str,
+    turn_id: &str,
+    run_id: &str,
+) -> Result<(), harness_agent_runtime::AgentError> {
+    if cancellation.is_requested() {
+        engine.append(session_id, EventPayload::RecoveryRequired {
+            operation_id: None,
+            reason: "turn stopped by user; in-flight model or tool completion was discarded".into(),
+        }, Some(turn_id.into()), None)?;
+        engine.append(session_id, EventPayload::RunCompleted {
+            run_id: run_id.into(), success: false,
+        }, Some(turn_id.into()), None)?;
+        return Err(harness_agent_runtime::AgentError::Stopped);
+    }
+    Ok(())
+}
+
+fn project_layers(engine: &SessionEngine, session_id: &str) -> Result<PromptLayers, AppError> {
+    let projection = engine.replay(session_id)?;
+    let mut layers = PromptLayers::default();
+    if let [root] = projection.workspace_roots.as_slice() {
+        let path = PathBuf::from(root).join("AGENTS.md");
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+            if metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= 64 * 1024 {
+                layers.project_rules = fs::read_to_string(&path).map_err(|error| AppError::Agent(error.to_string()))?;
+            }
+        }
+    }
+    Ok(layers)
+}
+
 fn build_broker(
     engine: &SessionEngine,
     config: &DaemonConfig,
@@ -1375,7 +1562,21 @@ fn build_broker(
     let roots = workspace_roots.into_iter().map(PathBuf::from).collect();
     match config.execution_backend.as_str() {
         "local-trusted-host" => {
-            let policy = PolicyEngine::new(PolicyConfig::trusted_workspace(roots))
+            let mut policy_config = PolicyConfig::trusted_workspace(roots);
+            if env::var("HARNESS_TRUSTED_AUTO_APPROVE").as_deref() == Ok("1") {
+                policy_config.approval_mode = ApprovalMode::AutoApproveTrustedWorkspace;
+            }
+            if env::var("HARNESS_TRUSTED_PROCESS").as_deref() == Ok("1") {
+                policy_config.allow_trusted_host_process = true;
+                for program in env::split_paths(&env::var_os("HARNESS_ALLOWED_PROGRAMS").unwrap_or_default()) {
+                    if program.is_absolute() {
+                        if let Ok(canonical) = fs::canonicalize(&program) {
+                            policy_config.allowed_programs.insert(canonical);
+                        }
+                    }
+                }
+            }
+            let policy = PolicyEngine::new(policy_config)
                 .map_err(|error| AppError::Agent(error.to_string()))?;
             Ok(ExecutionBroker::new(policy))
         }
@@ -1529,9 +1730,24 @@ fn receipt_error(receipt: &CommandReceipt) -> (i32, String) {
     (code, message)
 }
 
+struct SharedOutput<'a>(&'a Arc<Mutex<io::BufWriter<io::Stdout>>>);
+
+impl Write for SharedOutput<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut output = self.0.lock().unwrap();
+        output.write_all(bytes)?;
+        output.flush()?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.lock().unwrap().flush()
+    }
+}
+
 fn write_json<T: serde::Serialize>(writer: &mut impl Write, value: &T) -> io::Result<()> {
-    serde_json::to_writer(&mut *writer, value)
+    let mut bytes = serde_json::to_vec(value)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    writer.write_all(b"\n")?;
+    bytes.push(b'\n');
+    writer.write_all(&bytes)?;
     writer.flush()
 }

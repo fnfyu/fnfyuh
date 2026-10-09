@@ -6,6 +6,7 @@ const HIDDEN_SESSIONS_KEY = "fnfyuh.hidden-sessions";
 const LOCAL_ARTIFACTS_PREFIX = "fnfyuh.session-artifacts.";
 const LOCAL_HIDDEN_ARTIFACTS_PREFIX = "fnfyuh.hidden-artifacts.";
 const LOCAL_SESSION_CATALOG_KEY = "fnfyuh.session-catalog";
+const ACTIVE_SESSION_KEY = "fnfyuh.active-session";
 const TURN_PARAMETERS_KEY = "fnfyuh.turn-parameters";
 const MAX_ATTACHMENT_BYTES = 750_000;
 const MAX_TEXT_ATTACHMENT_CHARS = 240_000;
@@ -34,6 +35,9 @@ const state = {
   pendingAssistantMessage: null,
   uploadingCount: 0,
   turnInFlight: false,
+  activeTurnId: null,
+  activeRunId: null,
+  stopRequested: false,
   historyLoading: false,
   historyLoadGeneration: 0,
   settingsLoadGeneration: 0,
@@ -118,7 +122,10 @@ const EVENT_TYPE_LABELS = {
   run_started: "开始运行",
   model_requested: "模型请求",
   model_responded: "模型响应",
+  run_completed: "运行结束",
   tool_proposed: "工具请求",
+  policy_evaluated: "策略检查",
+  approval_granted: "已批准",
   tool_approval_requested: "待审批",
   approval_requested: "待审批",
   tool_started: "工具开始",
@@ -178,6 +185,7 @@ const inspectForm = $("#inspect-form");
 const turnForm = $("#turn-form");
 const turnContent = $("#turn-content");
 const sendButton = $("#send-button");
+const stopTurnButton = $("#stop-turn-button");
 const continueButton = $("#continue-button");
 const toolQueue = $("#tool-queue");
 const toolCount = $("#tool-count");
@@ -447,18 +455,36 @@ function editableSettings() {
 
 async function loadSettings() {
   const generation = ++state.settingsLoadGeneration;
-  const settings = await client.getSettings();
-  if (generation !== state.settingsLoadGeneration) return;
-  applySettings(settings);
-  settingsStatus.textContent = "已读取";
+  settingsStatus.textContent = "读取中…";
+  $("#add-provider-button").disabled = true;
+  $("#save-settings-button").disabled = true;
+  try {
+    const settings = await client.getSettings();
+    if (generation !== state.settingsLoadGeneration) return;
+    applySettings(settings);
+    settingsStatus.textContent = "已读取";
+  } finally {
+    if (generation === state.settingsLoadGeneration) {
+      $("#add-provider-button").disabled = false;
+      $("#save-settings-button").disabled = false;
+    }
+  }
 }
 
 async function saveSettings() {
   state.settingsLoadGeneration += 1;
-  const saved = await client.saveSettings(editableSettings());
-  applySettings(saved);
-  settingsStatus.textContent = "已保存";
-  showToast("已保存", "success");
+  settingsStatus.textContent = "保存中…";
+  $("#add-provider-button").disabled = true;
+  $("#save-settings-button").disabled = true;
+  try {
+    const saved = await client.saveSettings(editableSettings());
+    applySettings(saved);
+    settingsStatus.textContent = "已保存";
+    showToast("已保存", "success");
+  } finally {
+    $("#add-provider-button").disabled = false;
+    $("#save-settings-button").disabled = false;
+  }
 }
 
 function syncProviderEditor() {
@@ -688,7 +714,11 @@ function updateSessionChrome() {
   $("#model-pill").textContent = modelSelect.value || summary?.model || NO_MODEL_LABEL;
   turnContent.disabled = !state.sessionId;
   sendButton.disabled = !state.sessionId || state.uploadingCount > 0 || state.turnInFlight;
-  $("#turn-state").textContent = state.turnInFlight ? "运行中" : state.sessionId ? "就绪" : "空闲";
+  const waiting = Boolean(state.activeRunId) && [...state.tools.values()].some((tool) => tool.runId === state.activeRunId && ["pending", "approval"].includes(tool.status));
+  $("#turn-state").textContent = !state.sessionId ? "空闲" : state.stopRequested ? "停止中" : waiting ? "等待工具操作" : state.activeTurnId ? "运行中" : "就绪";
+  const stopping = Boolean(state.sessionId && state.activeTurnId);
+  stopTurnButton.hidden = !stopping;
+  stopTurnButton.disabled = !stopping || state.stopRequested;
 }
 
 function resetSessionView() {
@@ -704,6 +734,9 @@ function resetSessionView() {
   state.pendingAssistantMessage = null;
   state.uploadingCount = 0;
   state.turnInFlight = false;
+  state.activeTurnId = null;
+  state.activeRunId = null;
+  state.stopRequested = false;
   $("#event-count").textContent = "0";
   $("#artifact-count").textContent = "0";
   renderToolQueue();
@@ -724,6 +757,7 @@ async function setSession(sessionId, { restore = true } = {}) {
   state.subscriptionId = null;
   if (previousSubscriptionId) client.unsubscribe({ subscription_id: previousSubscriptionId }).catch(() => undefined);
   state.sessionId = sessionId;
+  try { window.localStorage?.setItem(ACTIVE_SESSION_KEY, sessionId); } catch {}
   resetSessionView();
   updateSessionChrome();
   renderSessionHistory();
@@ -807,8 +841,12 @@ async function loadSessions() {
     if (state.sessionId && !state.sessions.some((session) => session.id === state.sessionId)) {
       state.sessions.unshift(makeSessionSummary(state.sessionId));
     }
-    if (!state.sessionId && state.sessions.length === 1) {
-      await setSession(state.sessions[0].id);
+    if (!state.sessionId) {
+      let selectedId;
+      try { selectedId = window.localStorage?.getItem(ACTIVE_SESSION_KEY); } catch {}
+      const selected = state.sessions.find((session) => session.id === selectedId);
+      if (selected) await setSession(selected.id);
+      else if (state.sessions.length === 1) await setSession(state.sessions[0].id);
     }
   } catch (error) {
     if (generation === state.historyLoadGeneration) {
@@ -955,8 +993,31 @@ function toolStatusLabel(status) {
   return { pending: "待执行", approval: "待审批", running: "执行中", done: "完成", failed: "失败" }[status] ?? "待执行";
 }
 
+function renderChanges() {
+  const list = $("#change-list");
+  if (!list) return;
+  const changed = [...state.tools.values()].filter((tool) =>
+    ["WriteFile", "EditFile", "write_file", "edit_file"].includes(tool.intent?.kind) && tool.status === "done"
+  );
+  list.replaceChildren();
+  if (!changed.length) {
+    const empty = document.createElement("p");
+    empty.className = "timeline-empty";
+    empty.textContent = "暂无文件操作";
+    list.append(empty);
+    return;
+  }
+  for (const tool of changed) {
+    const entry = document.createElement("div");
+    entry.className = "change-entry";
+    entry.textContent = `${["WriteFile", "write_file"].includes(tool.intent.kind) ? "写入" : "编辑"} · ${tool.intent.data?.path ?? "未知文件"}`;
+    list.append(entry);
+  }
+}
+
 function renderToolQueue() {
   const tools = [...state.tools.values()];
+  renderChanges();
   toolCount.textContent = `${tools.length}`;
   toolQueue.replaceChildren();
   if (!tools.length) {
@@ -987,6 +1048,7 @@ function renderToolQueue() {
       button.type = "button";
       button.dataset.executeTool = tool.operationId;
       button.textContent = tool.status === "approval" ? "批准" : "执行";
+      button.disabled = Boolean(tool.executing) || (tool.status === "approval" && !tool.requestDigest);
       item.append(button);
     }
     if (tool.resultText) {
@@ -1014,6 +1076,23 @@ function renderToolQueue() {
   }
 }
 
+async function restoreToolOutput(tool, sessionId = state.sessionId) {
+  const artifactIds = [tool.stdoutArtifactId, tool.stderrArtifactId].filter(Boolean);
+  if (!sessionId || !artifactIds.length || tool.resultText) return;
+  const chunks = [];
+  for (const artifactId of artifactIds) {
+    try {
+      const artifact = await client.getArtifact({ session_id: sessionId, artifact_id: artifactId, offset: 0, limit: 131072 });
+      if (artifact?.content) chunks.push(artifact.content);
+    } catch {
+      // The durable status is still useful when an old artifact is unavailable.
+    }
+  }
+  if (state.sessionId !== sessionId || !chunks.length) return;
+  tool.resultText = chunks.join("\n");
+  renderToolQueue();
+}
+
 function updateToolFromEvent(event) {
   const type = normalizedEventType(event);
   const data = eventPayloadData(event);
@@ -1030,24 +1109,42 @@ function updateToolFromEvent(event) {
   if (type === "tool_proposed") Object.assign(existing, { toolName: data.tool_name ?? existing.toolName, intent: data.intent, turnId: data.turn_id, runId: data.run_id, status: "pending" });
   if (type === "approval_requested" || type === "tool_approval_requested") Object.assign(existing, { requestDigest: data.request_digest, status: "approval" });
   if (type === "tool_started") existing.status = "running";
-  if (type === "tool_finished") existing.status = "done";
-  if (type === "tool_failed" || type === "execution_unknown") existing.status = "failed";
-  if (type === "artifact_created") existing.artifactId = data.artifact_id;
+  if (type === "tool_finished") {
+    const result = data.result ?? {};
+    Object.assign(existing, {
+      status: result.status === "succeeded" ? "done" : "failed",
+      stdoutArtifactId: result.stdout_artifact_id ?? existing.stdoutArtifactId,
+      stderrArtifactId: result.stderr_artifact_id ?? existing.stderrArtifactId,
+    });
+  }
+  if (type === "tool_failed" || type === "execution_unknown") {
+    existing.status = "failed";
+    existing.resultText = data.message ?? data.reason ?? "工具执行失败";
+  }
+  if (type === "artifact_created") {
+    if (data.kind === "stderr") existing.stderrArtifactId = data.artifact_id;
+    else if (data.kind === "stdout") existing.stdoutArtifactId = data.artifact_id;
+  }
   state.tools.set(operationId, existing);
   renderToolQueue();
+  updateSessionChrome();
+  if (type === "tool_finished") void restoreToolOutput(existing, event.session_id);
 }
 
 function appendToolResult(operationId, result) {
   const tool = state.tools.get(operationId);
   if (!tool) return;
   const output = result?.result ?? result;
-  tool.status = result?.accepted === false ? "approval" : "done";
-  tool.resultText = output?.stdout || output?.stderr || (result?.error ? result.error : "已完成，无输出");
+  const succeeded = output?.status === "succeeded";
+  tool.status = result?.accepted === false ? "approval" : succeeded ? "done" : "failed";
+  const textParts = [output?.stdout, output?.stderr].filter(Boolean);
+  tool.resultText = textParts.join("\n") || (result?.error ? result.error : succeeded ? "已完成，无输出" : `执行${output?.status ? ` ${output.status}` : "失败"}`);
   if (output?.output_media_type && output?.output_encoding === "base64" && output.stdout) {
     tool.imageDataUrl = `data:${output.output_media_type};base64,${output.stdout}`;
     tool.resultText = `已读取图片 · ${output.output_media_type}`;
   }
   renderToolQueue();
+  updateSessionChrome();
 }
 
 function formatType(event) {
@@ -1483,7 +1580,16 @@ function addEvent(event, generation = state.sessionGeneration) {
   const data = eventPayloadData(event);
   if (type === "user_message" && state.pendingUserMessage?.turnId === data.turn_id) state.pendingUserMessage = null;
   if (type === "model_responded" && state.pendingAssistantMessage?.turnId === data.turn_id) state.pendingAssistantMessage = null;
+  if (type === "turn_started") state.activeTurnId = data.turn_id;
+  if (type === "run_started" && data.turn_id === state.activeTurnId) state.activeRunId = data.run_id;
+  if (type === "run_completed" && data.run_id === state.activeRunId) {
+    state.activeTurnId = null;
+    state.activeRunId = null;
+    state.stopRequested = false;
+    state.turnInFlight = false;
+  }
   state.events.push(event);
+  updateSessionChrome();
   state.events.sort((left, right) => left.global_sequence - right.global_sequence);
   const summary = currentSessionSummary();
   if (summary) {
@@ -1568,12 +1674,14 @@ turnForm.addEventListener("submit", async (event) => {
   if (new TextEncoder().encode(fullContent).length + imagePayloadSize > 1_500_000) return showToast("消息过大", "warning");
   const displayContent = displayContentForAttachments(content, queued);
   state.turnInFlight = true;
+  state.activeTurnId = turnId;
+  state.stopRequested = false;
   state.messageAttachments.set(turnId, queued.slice());
   state.pendingUserMessage = { turnId, displayContent, attachments: queued.slice() };
   state.pendingAssistantMessage = null;
   renderConversation();
   sendButton.disabled = true;
-  $("#turn-state").textContent = "运行中";
+  updateSessionChrome();
   turnContent.value = "";
   try {
     const result = await client.startTurn({
@@ -1590,7 +1698,12 @@ turnForm.addEventListener("submit", async (event) => {
       state.pendingAssistantMessage = { turnId, content: result.response.content };
       renderConversation();
     }
-    if (!result.accepted) showToast(resultError(result.error, "需恢复"), "warning");
+    if (!result.accepted) {
+      state.activeTurnId = null;
+      state.activeRunId = null;
+      state.stopRequested = false;
+      showToast(resultError(result.error, "需恢复"), "warning");
+    }
     else {
       for (const attachment of queued) state.queuedAttachmentIds.delete(attachment.id);
       writeLocalArtifacts(sessionId);
@@ -1598,13 +1711,44 @@ turnForm.addEventListener("submit", async (event) => {
       showToast("已提交", "success");
     }
   } catch (error) {
-    if (generation === state.sessionGeneration && state.sessionId === sessionId) showToast(displayError(error), "error");
+    if (generation === state.sessionGeneration && state.sessionId === sessionId) {
+      state.activeTurnId = null;
+      state.activeRunId = null;
+      state.stopRequested = false;
+      showToast(displayError(error), "error");
+    }
   } finally {
     if (generation === state.sessionGeneration && state.sessionId === sessionId) {
       state.turnInFlight = false;
-      $("#turn-state").textContent = "就绪";
       updateSessionChrome();
     }
+  }
+});
+
+stopTurnButton.addEventListener("click", async () => {
+  const sessionId = state.sessionId;
+  const turnId = state.activeTurnId;
+  if (!sessionId || !turnId || state.stopRequested) return;
+  state.stopRequested = true;
+  updateSessionChrome();
+  try {
+    const result = await client.request("runtime.v1.turn.stop", {
+      session_id: sessionId,
+      turn_id: turnId,
+      ...(state.activeRunId ? { run_id: state.activeRunId } : {}),
+    });
+    if (state.sessionId !== sessionId || state.activeTurnId !== turnId) return;
+    if (!result?.accepted) {
+      state.stopRequested = false;
+      showToast("当前没有正在执行的步骤", "warning");
+    } else showToast("已请求停止，当前步骤结束后生效", "info");
+  } catch (error) {
+    if (state.sessionId === sessionId && state.activeTurnId === turnId) {
+      state.stopRequested = false;
+      showToast(displayError(error, "停止失败"), "error");
+    }
+  } finally {
+    if (state.sessionId === sessionId) updateSessionChrome();
   }
 });
 
@@ -1880,6 +2024,8 @@ toolQueue.addEventListener("click", async (event) => {
   if (!button || !sessionId) return;
   const tool = state.tools.get(button.dataset.executeTool);
   if (!tool?.intent) return showToast("缺少工具参数", "error");
+  if (tool.executing || button.disabled) return;
+  tool.executing = true;
   button.disabled = true;
   try {
     const approval = tool.requestDigest
@@ -1902,6 +2048,7 @@ toolQueue.addEventListener("click", async (event) => {
   } catch (error) {
     if (generation === state.sessionGeneration && state.sessionId === sessionId) showToast(displayError(error, "工具执行失败，请重试。"), "error");
   } finally {
+    tool.executing = false;
     if (generation === state.sessionGeneration && state.sessionId === sessionId) renderToolQueue();
   }
 });

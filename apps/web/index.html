@@ -63,6 +63,7 @@
                 <div class="conversation-status">
                   <span class="pill neutral" id="model-pill">gpt-5.4</span>
                   <span class="pill neutral" id="turn-state" role="status" aria-live="polite">空闲</span>
+                  <button class="button secondary compact-button stop-button" id="stop-turn-button" type="button" hidden aria-label="停止当前任务">停止</button>
                 </div>
               </header>
               <div class="conversation" id="conversation" aria-live="polite">
@@ -153,6 +154,12 @@
                 <div class="tool-queue" id="tool-queue" aria-live="polite">
                   <p class="timeline-empty">暂无请求</p>
                 </div>
+              </section>
+
+              <section class="utility-section" aria-label="文件操作记录">
+                <div class="section-heading compact-heading"><h3>文件操作记录</h3></div>
+                <div class="change-list" id="change-list" aria-live="polite"><p class="timeline-empty">暂无文件操作</p></div>
+                <p class="helper">仅汇总已成功的写入和编辑；不是 Git diff，提交前请核对工作区。</p>
               </section>
 
               <section class="utility-section" aria-label="操作">

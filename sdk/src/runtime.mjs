@@ -124,8 +124,11 @@ export class StdioJsonRpcTransport {
   #child;
   #pending = new Map();
   #listeners = new Set();
+  #timeoutMs;
+  #closed = false;
 
   constructor(command = "harnessd", args = [], options = {}) {
+    this.#timeoutMs = options.timeoutMs ?? 120_000;
     this.#child = spawn(command, args, {
       cwd: options.cwd,
       env: options.env ?? process.env,
@@ -142,21 +145,46 @@ export class StdioJsonRpcTransport {
       if (message.id !== undefined && message.id !== null && this.#pending.has(message.id)) {
         const pending = this.#pending.get(message.id);
         this.#pending.delete(message.id);
+        clearTimeout(pending.timeout);
         pending.resolve(message);
       } else {
         for (const listener of this.#listeners) listener(message);
       }
     });
-    this.#child.on("error", (error) => {
-      for (const pending of this.#pending.values()) pending.reject(error);
+    const rejectPending = (error) => {
+      if (this.#closed) return;
+      this.#closed = true;
+      for (const pending of this.#pending.values()) {
+        clearTimeout(pending.timeout);
+        pending.reject(error);
+      }
       this.#pending.clear();
+    };
+    this.#child.on("error", rejectPending);
+    this.#child.on("exit", (code, signal) => {
+      rejectPending(new Error(`stdio daemon exited${code === null ? "" : ` with code ${code}`}${signal ? ` (${signal})` : ""}`));
+    });
+    this.#child.on("close", (code, signal) => {
+      rejectPending(new Error(`stdio daemon closed${code === null ? "" : ` with code ${code}`}${signal ? ` (${signal})` : ""}`));
     });
   }
 
   request(request) {
+    if (this.#closed) return Promise.reject(new Error("stdio daemon is closed"));
     return new Promise((resolve, reject) => {
-      this.#pending.set(request.id, { resolve, reject });
-      this.#child.stdin.write(`${JSON.stringify(request)}\n`);
+      const timeout = setTimeout(() => {
+        if (!this.#pending.delete(request.id)) return;
+        reject(new Error(`stdio request ${String(request.id)} timed out after ${this.#timeoutMs} ms`));
+      }, this.#timeoutMs);
+      this.#pending.set(request.id, { resolve, reject, timeout });
+      this.#child.stdin.write(`${JSON.stringify(request)}\n`, (error) => {
+        if (!error) return;
+        const pending = this.#pending.get(request.id);
+        if (!pending) return;
+        this.#pending.delete(request.id);
+        clearTimeout(pending.timeout);
+        pending.reject(error);
+      });
     });
   }
 

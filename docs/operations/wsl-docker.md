@@ -41,6 +41,8 @@ HARNESS_WORKSPACE="$PWD" docker compose --profile cli run --rm cli replay <sessi
 # Start the daemon directly for another client
 HARNESS_WORKSPACE="$PWD" docker compose run --rm harnessd
 
+# Rebuild current source first: the bind mount does not update the daemon binary
+HARNESS_WORKSPACE="$PWD" docker compose build harnessd
 # Start the browser gateway (open http://127.0.0.1:8787)
 HARNESS_WORKSPACE="$PWD" docker compose --profile web up gateway
 ```
@@ -64,6 +66,10 @@ docker image inspect local-first-harness:dev
 # Open a shell in the runtime image
 docker compose run --rm --entrypoint /bin/bash harnessd
 ```
+
+## Gateway access
+
+The Web profile uses host networking and binds `127.0.0.1:8787` by default; local browsers can call `/rpc` and `/events` without a token. To expose the gateway outside loopback, explicitly set `HARNESS_GATEWAY_HOST` and `HARNESS_GATEWAY_TOKEN`; without a token, non-loopback RPC/events are denied even if the request spoofs `Host: localhost`. The read-only `/app` source mount updates gateway/Web files, **not** `/usr/local/bin/harnessd` in the image. After daemon or dependency changes, rebuild and restart the gateway; `fnfyuh web` builds incrementally by default, while `--no-build` explicitly reuses the old image.
 
 ## Security posture
 

@@ -375,6 +375,7 @@ impl DockerContainerBackend {
         };
         let mut args = vec![
             "run".to_string(),
+            "--interactive".to_string(),
             "--name".to_string(),
             operation_name,
             "--label".to_string(),
@@ -470,15 +471,13 @@ impl DockerContainerBackend {
             None,
             started,
         )?;
-        if !matches!(result.status, ToolStatus::TimedOut) {
-            let container_name = self.operation_name(
-                &authorized.prepared.operation_id,
-                &authorized.prepared.context.session_id,
-            );
-            let _ = Command::new(&self.config.runtime)
-                .args(["rm", "-f", container_name.as_str()])
-                .output();
-        }
+        let container_name = self.operation_name(
+            &authorized.prepared.operation_id,
+            &authorized.prepared.context.session_id,
+        );
+        let _ = Command::new(&self.config.runtime)
+            .args(["rm", "-f", container_name.as_str()])
+            .output();
         Ok(result)
     }
 

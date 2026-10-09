@@ -2,10 +2,10 @@ import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 
-const settingsPath = process.env.HARNESS_SETTINGS
+const defaultSettingsPath = process.env.HARNESS_SETTINGS
   ?? join(dirname(process.env.HARNESS_DB ?? ".runtime/events.sqlite"), "fnfyuh-settings.json");
 
-async function readSettingsProvider(providerId) {
+async function readSettingsProvider(providerId, settingsPath = defaultSettingsPath) {
   try {
     const raw = JSON.parse(await readFile(settingsPath, "utf8"));
     return (raw.providers ?? []).find((provider) => provider.id === providerId);
@@ -26,7 +26,11 @@ function modelsFromCatalog(models) {
 function modelListUrl(endpoint) {
   const value = String(endpoint ?? "").replace(/\/+$/, "");
   if (!value) throw new Error("provider endpoint is required");
-  const normalized = value
+  const parsed = new URL(value);
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("provider endpoint must use http or https");
+  }
+  const normalized = parsed.href.replace(/\/+$/, "")
     .replace(/\/chat\/completions$/i, "/models")
     .replace(/\/messages$/i, "/models")
     .replace(/\/responses$/i, "/models");
@@ -34,11 +38,10 @@ function modelListUrl(endpoint) {
 }
 
 function providerFromInput(input, stored) {
+  if (stored) return stored;
   return {
-    ...(stored ?? {}),
     ...(input?.kind ? { kind: input.kind } : {}),
     ...(input?.endpoint ? { endpoint: input.endpoint } : {}),
-    ...(input?.api_key_env ? { api_key_env: input.api_key_env } : {}),
   };
 }
 
@@ -75,10 +78,10 @@ async function listRemoteModels(provider) {
     .filter((model) => model.id);
 }
 
-export async function listProviderModels(input = {}) {
+export async function listProviderModels(input = {}, options = {}) {
   const providerId = String(input.provider_id ?? "").trim();
   if (!providerId) throw new Error("provider_id is required");
-  const stored = await readSettingsProvider(providerId);
+  const stored = await readSettingsProvider(providerId, options.settingsPath);
   const provider = providerFromInput(input, stored);
   if (provider.kind === "openai_codex") {
     return { provider_id: providerId, models: modelsFromCatalog(openaiCodexProvider().getModels()) };

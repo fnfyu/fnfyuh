@@ -84,20 +84,20 @@ pub struct ModelParameters {
 
 impl ModelParameters {
     pub fn validate(&self) -> Result<(), String> {
-        if let Some(level) = self.reasoning_effort.as_deref()
-            && !matches!(level, "auto" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max")
-        {
-            return Err(format!("unsupported reasoning_effort `{level}`"));
+        if let Some(level) = self.reasoning_effort.as_deref() {
+            if !matches!(level, "auto" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max") {
+                return Err(format!("unsupported reasoning_effort `{level}`"));
+            }
         }
-        if let Some(temperature) = self.temperature
-            && (!temperature.is_finite() || !(0.0..=2.0).contains(&temperature))
-        {
-            return Err("temperature must be a finite number between 0 and 2".to_string());
+        if let Some(temperature) = self.temperature {
+            if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
+                return Err("temperature must be a finite number between 0 and 2".to_string());
+            }
         }
-        if let Some(max_output_tokens) = self.max_output_tokens
-            && !(16..=131_072).contains(&max_output_tokens)
-        {
-            return Err("max_output_tokens must be between 16 and 131072".to_string());
+        if let Some(max_output_tokens) = self.max_output_tokens {
+            if !(16..=131_072).contains(&max_output_tokens) {
+                return Err("max_output_tokens must be between 16 and 131072".to_string());
+            }
         }
         Ok(())
     }

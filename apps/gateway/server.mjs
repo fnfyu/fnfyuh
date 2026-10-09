@@ -2,23 +2,19 @@
 
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
-import { extname, join, normalize } from "node:path";
-import { spawn } from "node:child_process";
+import { extname, normalize } from "node:path";
+import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { StdioJsonRpcTransport } from "../../sdk/src/runtime.mjs";
 import { handleCodexRpc } from "./codex-auth.mjs";
 import { handleProviderModelsRpc } from "./provider-models.mjs";
 
 const root = new URL("../web/", import.meta.url);
-const port = Number(process.env.HARNESS_GATEWAY_PORT ?? 8787);
-const host = process.env.HARNESS_GATEWAY_HOST ?? "127.0.0.1";
-const daemonCommand = process.env.HARNESSD ?? "harnessd";
-const gatewayToken = process.env.HARNESS_GATEWAY_TOKEN ?? "";
-const daemon = new StdioJsonRpcTransport(daemonCommand, [], {
-  cwd: process.cwd(),
-  env: process.env,
-});
-let requestId = 1;
+
+function isLoopbackHost(host) {
+  const normalized = String(host ?? "").trim().replace(/^\[|\]$/g, "").toLowerCase();
+  return normalized === "localhost" || normalized === "::1" || normalized.startsWith("127.");
+}
 
 function jsonHeaders() {
   return {
@@ -33,12 +29,8 @@ function sendJson(response, status, body) {
   response.end(JSON.stringify(body));
 }
 
-function requestAuthorized(request, url) {
-  const loopback = ["127.0.0.1", "localhost", "::1"].includes(url.hostname)
-    || host === "127.0.0.1"
-    || host === "localhost"
-    || host === "::1";
-  if (!gatewayToken) return loopback;
+function requestAuthorized(request, url, host, gatewayToken) {
+  if (!gatewayToken) return isLoopbackHost(host);
   return request.headers.authorization === `Bearer ${gatewayToken}`
     || url.searchParams.get("access_token") === gatewayToken;
 }
@@ -54,14 +46,18 @@ async function readBody(request, maxBytes = 2 * 1024 * 1024) {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-async function forwardRpc(payload) {
-  const request = {
-    jsonrpc: "2.0",
-    id: payload.id ?? `gateway-${requestId++}`,
-    method: payload.method,
-    params: payload.params ?? {},
+export function createRpcForwarder(daemon) {
+  return async function forwardRpc(payload) {
+    const browserId = payload.id ?? null;
+    const internalId = `gateway-${randomUUID()}`;
+    const result = await daemon.request({
+      jsonrpc: "2.0",
+      id: internalId,
+      method: payload.method,
+      params: payload.params ?? {},
+    });
+    return { ...result, id: browserId };
   };
-  return daemon.request(request);
 }
 
 function safeAsset(pathname) {
@@ -97,7 +93,7 @@ async function serveAsset(response, pathname) {
   }
 }
 
-async function streamEvents(request, response, url) {
+async function streamEvents(request, response, url, forwardRpc) {
   const sessionId = url.searchParams.get("session_id") ?? "";
   const existingSubscriptionId = url.searchParams.get("subscription_id");
   const after = Number(url.searchParams.get("after_global_sequence") ?? 0);
@@ -147,44 +143,61 @@ async function streamEvents(request, response, url) {
   });
 }
 
-const server = createServer(async (request, response) => {
-  try {
-    const url = new URL(request.url ?? "/", `http://${request.headers.host ?? `${host}:${port}`}`);
-    if (["/rpc", "/events"].includes(url.pathname) && !requestAuthorized(request, url)) {
-      return sendJson(response, 401, { error: "gateway authentication required" });
-    }
-    if (request.method === "OPTIONS") {
-      response.writeHead(204, { "access-control-allow-methods": "GET,POST,OPTIONS", "access-control-allow-headers": "content-type" });
-      return response.end();
-    }
-    if (request.method === "GET" && url.pathname === "/health") {
-      return sendJson(response, 200, { status: "ok", service: "harness-gateway" });
-    }
-    if (request.method === "POST" && url.pathname === "/rpc") {
-      const payload = JSON.parse(await readBody(request));
-      const localCodexResult = await handleCodexRpc(payload);
-      const localProviderModelsResult = await handleProviderModelsRpc(payload);
-      const result = localCodexResult ?? localProviderModelsResult ?? await forwardRpc(payload);
-      response.writeHead(200, jsonHeaders());
-      return response.end(JSON.stringify(result));
-    }
-    if (request.method === "GET" && url.pathname === "/events") {
-      return streamEvents(request, response, url);
-    }
-    if (request.method === "GET") return serveAsset(response, url.pathname);
-    sendJson(response, 405, { error: "method not allowed" });
-  } catch (error) {
-    sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) });
+export function createGatewayServer({ host = "127.0.0.1", token = "", daemon }) {
+  const forwardRpc = createRpcForwarder(daemon);
+
+  async function streamGatewayEvents(request, response, url) {
+    return streamEvents(request, response, url, forwardRpc);
   }
-});
 
-server.listen(port, host, () => {
-  process.stdout.write(`harness gateway listening on http://${host}:${port}\n`);
-});
-
-function shutdown() {
-  server.close();
-  daemon.close();
+  return createServer(async (request, response) => {
+    try {
+      // URL parsing needs an origin, but authentication deliberately ignores the untrusted Host header.
+      const url = new URL(request.url ?? "/", "http://gateway.invalid");
+      if (["/rpc", "/events"].includes(url.pathname) && !requestAuthorized(request, url, host, token)) {
+        return sendJson(response, 401, { error: "gateway authentication required" });
+      }
+      if (request.method === "OPTIONS") {
+        response.writeHead(204, { "access-control-allow-methods": "GET,POST,OPTIONS", "access-control-allow-headers": "content-type,authorization" });
+        return response.end();
+      }
+      if (request.method === "GET" && url.pathname === "/health") {
+        return sendJson(response, 200, { status: "ok", service: "harness-gateway" });
+      }
+      if (request.method === "POST" && url.pathname === "/rpc") {
+        const payload = JSON.parse(await readBody(request));
+        const localCodexResult = await handleCodexRpc(payload);
+        const localProviderModelsResult = await handleProviderModelsRpc(payload);
+        const result = localCodexResult ?? localProviderModelsResult ?? await forwardRpc(payload);
+        response.writeHead(200, jsonHeaders());
+        return response.end(JSON.stringify(result));
+      }
+      if (request.method === "GET" && url.pathname === "/events") {
+        return streamGatewayEvents(request, response, url);
+      }
+      if (request.method === "GET") return serveAsset(response, url.pathname);
+      sendJson(response, 405, { error: "method not allowed" });
+    } catch (error) {
+      sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) });
+    }
+  });
 }
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const port = Number(process.env.HARNESS_GATEWAY_PORT ?? 8787);
+  const host = process.env.HARNESS_GATEWAY_HOST ?? "127.0.0.1";
+  const daemon = new StdioJsonRpcTransport(process.env.HARNESSD ?? "harnessd", [], {
+    cwd: process.cwd(),
+    env: process.env,
+  });
+  const server = createGatewayServer({ host, token: process.env.HARNESS_GATEWAY_TOKEN ?? "", daemon });
+  server.listen(port, host, () => {
+    process.stdout.write(`harness gateway listening on http://${host}:${port}\n`);
+  });
+  function shutdown() {
+    server.close();
+    daemon.close();
+  }
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+}

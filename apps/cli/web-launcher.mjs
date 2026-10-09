@@ -11,14 +11,16 @@ function usage(commandName) {
   ${commandName} --help
 
 说明：
-  ${commandName} web       启动 fnfyu harness Web 网关，镜像不存在时自动构建
-  --build                  强制同步 Docker 镜像
-  --no-build               跳过镜像检查与构建，直接启动网关
+  ${commandName} web       增量构建当前源码的 Docker 镜像，再启动 Web 网关
+  --build                  构建时检查基础镜像更新
+  --no-build               跳过构建，直接使用现有镜像（可能包含旧版 daemon）
 
 环境变量：
   HARNESS_PROJECT_ROOT     覆盖项目根目录
   HARNESS_WORKSPACE        覆盖要挂载到运行时的工作区
-  FNFYU_HARNESS_IMAGE      覆盖 Docker 镜像名`);
+  FNFYU_HARNESS_IMAGE      覆盖 Docker 镜像名
+  HARNESS_GATEWAY_HOST     默认 127.0.0.1；非本地绑定需要设置 HARNESS_GATEWAY_TOKEN
+  HARNESS_GATEWAY_TOKEN    非本地部署的网关访问令牌`);
 }
 
 function shellQuote(value) {
@@ -51,10 +53,8 @@ async function runDockerWeb(commandName, { noBuild, forceBuild }) {
   const workspace = process.env.HARNESS_WORKSPACE ?? process.cwd();
   const composeFile = resolve(root, "docker-compose.yml");
   const build = noBuild
-    ? ""
-    : forceBuild
-      ? `echo '${commandName}: 正在同步 fnfyu harness 镜像…'\ndocker compose -f ${shellQuote(toWslPath(composeFile))} build --pull harnessd || exit $?\n`
-      : `if ! docker image inspect ${shellQuote(imageName)} >/dev/null 2>&1; then\n  echo '${commandName}: 未找到 fnfyu harness 镜像，正在构建…'\n  docker compose -f ${shellQuote(toWslPath(composeFile))} build --pull harnessd || exit $?\nfi\n`;
+    ? `if ! docker image inspect ${shellQuote(imageName)} >/dev/null 2>&1; then\n  echo '${commandName}: 镜像不存在；请去掉 --no-build 以构建镜像' >&2\n  exit 1\nfi\n`
+    : `echo '${commandName}: 正在构建当前源码镜像（包括 daemon）…'\ndocker compose -f ${shellQuote(toWslPath(composeFile))} build ${forceBuild ? "--pull " : ""}harnessd || exit $?\n`;
   const command = `${build}export HARNESS_PROJECT_ROOT=${shellQuote(toWslPath(root))}\nexport HARNESS_WORKSPACE=${shellQuote(toWslPath(workspace))}\nexec docker compose -f ${shellQuote(toWslPath(composeFile))} --profile web up gateway`;
 
   if (process.platform === "win32") {

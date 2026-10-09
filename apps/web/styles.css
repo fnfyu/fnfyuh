@@ -374,6 +374,11 @@ input:focus, textarea:focus, select:focus { border-color: var(--color-accent); b
 .tool-item[data-status="done"] { border-color: rgb(130 255 91 / 42%); }
 .tool-item[data-status="failed"] { border-color: rgb(255 92 66 / 55%); }
 .tool-result { max-height: 150px; overflow: auto; margin: 0; padding: 8px; border: 1px solid var(--color-border-soft); border-radius: 3px; color: #d0cdbc; background: #080808; font: 10px/1.5 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.change-list { display: grid; gap: 6px; max-height: 140px; overflow: auto; }
+.change-entry { padding: 7px 9px; border: 1px solid var(--color-border-soft); border-radius: var(--radius-sm); color: var(--color-foreground); background: #0c0c0b; font: 11px/1.5 var(--font-mono); overflow-wrap: anywhere; }
+.stop-button:not([hidden]) { min-height: 34px; padding: 5px 12px; border-color: rgb(255 92 66 / 55%); color: var(--color-destructive); font: 600 11px var(--font-mono); }
+.stop-button:not([hidden]):hover { border-color: var(--color-destructive); background: rgb(255 92 66 / 10%); }
+.stop-button:disabled { opacity: .55; }
 .media-preview-button { display: block; width: 100%; padding: 0; border: 0; border-radius: var(--radius-sm); background: transparent; cursor: zoom-in; }
 .tool-preview { display: block; width: 100%; max-height: 220px; border: 1px solid var(--color-border); border-radius: var(--radius-sm); object-fit: contain; background: #080808; cursor: zoom-in; }
 

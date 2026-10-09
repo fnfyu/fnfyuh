@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   JsonRpcClient,
   RpcError,
+  StdioJsonRpcTransport,
   createInMemoryTransport,
   requestDigest,
   stableModelHistory,
@@ -67,6 +68,30 @@ test("canonical request digest is independent of object key order", () => {
     requestDigest({ b: 2, a: { d: false, c: true } }),
     requestDigest({ a: { c: true, d: false }, b: 2 }),
   );
+});
+
+test("stdio transport rejects pending requests when the daemon exits", async () => {
+  const transport = new StdioJsonRpcTransport(process.execPath, ["-e", "process.stdin.resume(); setTimeout(() => process.exit(23), 20)"], { timeoutMs: 5_000 });
+  try {
+    await assert.rejects(
+      () => transport.request({ jsonrpc: "2.0", id: "exit-test", method: "wait", params: {} }),
+      /exited|closed/i,
+    );
+  } finally {
+    transport.close();
+  }
+});
+
+test("stdio transport applies a configurable request timeout", async () => {
+  const transport = new StdioJsonRpcTransport(process.execPath, ["-e", "process.stdin.resume()"], { timeoutMs: 25 });
+  try {
+    await assert.rejects(
+      () => transport.request({ jsonrpc: "2.0", id: "timeout-test", method: "wait", params: {} }),
+      /timed out.*25 ms/i,
+    );
+  } finally {
+    transport.close();
+  }
 });
 
 test("JSON-RPC client preserves typed errors and receives committed events", async () => {

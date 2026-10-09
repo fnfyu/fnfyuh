@@ -4,9 +4,11 @@
 
 ## 当前状态
 
-第一阶段的 Rust workspace、SQLite hash-chained append-only event log、replay/resume/fork projection、deny-by-default policy、trusted-workspace execution seam、stdio daemon、CLI 和 TypeScript SDK 已落盘，并已在 WSL2 Docker builder 中通过 Rust/Node 验证。
+核心 coding-agent 循环已可用：多步任务中只读工具（read/list/search/image）自动执行，写入/编辑/进程工具经审批后继续，测试失败会把真实 stdout/stderr 反馈给模型修复后重试，跨回合保留最近 192 KiB 工具输出上下文，运行中的任务可通过 `runtime.v1.turn.stop` 请求停止（当前步骤结束后不再继续，不中断已发出的模型请求）。模型步数上限 32 步/回合。
 
-当前已提供带 `command_id` 的 SQLite durable receipt/replay seam、create/fork/recover 的原子 receipt+fact 提交、typed session/cursor backlog subscription、租约化持久 outbox、artifact retrieval、backend inspect/continuation，以及可配置的 provider/model settings。内置工具包含 read、list、search、image preview、write、edit 和受策略约束的进程工具；配置只保存 provider/model 元数据和 secret reference，不保存 API key。执行面默认仍是明确标注的 trusted-host；`container`/`vm` 只在 Docker engine、镜像和运行时预检通过时启用，失败即 fail-closed，不会回退到 host。Web/IDE 客户端位于 `apps/web`、`apps/gateway` 和 `apps/ide`。
+底座包含：SQLite hash-chained append-only event log、replay/resume/fork projection、deny-by-default policy、trusted-workspace execution seam、stdio daemon、CLI 和 TypeScript SDK，均已在 WSL2 Docker builder 中通过 Rust/Node 测试。带 `command_id` 的 durable receipt/replay、create/fork/recover 原子提交、typed subscription、租约化持久 outbox、artifact retrieval、backend inspect/continuation，以及可配置的 provider/model settings。配置只保存 provider/model 元数据和 secret reference，不保存 API key。执行面默认仍是明确标注的 trusted-host；`container`/`vm` 只在预检通过时启用，失败即 fail-closed，不会回退到 host。Web/IDE 客户端位于 `apps/web`、`apps/gateway` 和 `apps/ide`。
+
+尚未完成：daemon 在模型/工具执行期间无法响应除 stop 外的并发 RPC（同步串行循环）；无 session 级 diff 视图（Web 的文件操作记录仅汇总成功的写入/编辑）；无 token 流式输出（回合以完整响应结束）。
 
 ## 设计原则
 
@@ -35,7 +37,7 @@ docs/changes/            accepted change pack
 pnpm fnfyuh web
 ```
 
-它会通过 WSL2 + Docker 检查 `local-first-harness:dev` 镜像；镜像不存在时自动构建，然后启动 fnfyu harness 网关。当前仓库源码会以只读方式挂载到网关，因此 Web 文案修改无需重新构建镜像。浏览器打开 <http://127.0.0.1:8787>。
+它会通过 WSL2 + Docker **增量构建当前源码镜像**（包括 Rust daemon；不默认强制拉取基础镜像），然后启动 fnfyu harness 网关。当前仓库源码只读挂载到网关可即时更新 Web/网关脚本，但**不会更新镜像内的 `/usr/local/bin/harnessd` 和镜像依赖**；修改 Rust、依赖或打包内容后须重建镜像并重启网关。默认 host network 只监听 `127.0.0.1:8787`，本机浏览器无需设置 token，可打开 <http://127.0.0.1:8787>。WSL/Docker Desktop 环境中请确认 Windows 侧 localhost 转发正常。
 
 Windows PowerShell 也可以使用不依赖全局安装的 wrapper：
 
@@ -50,12 +52,16 @@ pnpm link --global
 fnfyuh web
 ```
 
-已有镜像时可以跳过检查，需要刷新 daemon 或镜像内容时强制构建：
+仅确认现有镜像与当前源码匹配时，可显式跳过构建；该选项会继续使用旧 daemon 二进制。需要检查基础镜像更新时使用 `--build`（带 `docker compose build --pull`）：
 
 ```bash
 fnfyuh web --no-build
 fnfyuh web --build
 ```
+
+显式非本地部署可覆盖 `HARNESS_GATEWAY_HOST`，但必须配置 `HARNESS_GATEWAY_TOKEN`；无 token 时非 loopback 监听的 `/rpc` 和 `/events` 会拒绝请求。不要将 `0.0.0.0` 视为本地模式；浏览器 token 配置仅适用于显式部署，不是默认启动步骤。
+
+编码任务若需要运行测试/编译命令，默认本地策略只允许工作区文件读写，不运行宿主进程。由你信任此工作区时设置 `HARNESS_TRUSTED_PROCESS=1`，并通过 `HARNESS_ALLOWED_PROGRAMS` 提供**绝对可执行文件路径**的列表（Linux/WSL 用冒号分隔，如 `/usr/bin/python3:/usr/bin/git`）；然后重启网关。写文件和运行命令默认仍要在界面批准；仅需无人值守时才另设 `HARNESS_TRUSTED_AUTO_APPROVE=1`。该模式的进程在网关容器内以用户权限运行，**不是沙箱**，请不要用于不信任的工作区。
 
 原有 `pnpm dsh web` 仍作为兼容入口保留，不会覆盖系统已有的 DeepSeek Harness `dsh` 命令。
 

@@ -17,3 +17,7 @@ uuid.workspace = true
 ureq.workspace = true
 idna.workspace = true
 idna_adapter.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+harness-policy-engine = { path = "../policy-engine" }

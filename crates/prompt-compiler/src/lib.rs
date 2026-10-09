@@ -7,6 +7,7 @@
 use harness_protocol::{canonical_json, EventEnvelope, EventPayload, ToolIntent};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 pub const COMPILER_VERSION: &str = "prompt-compiler.v1";
 
@@ -56,6 +57,17 @@ pub fn compile(
     layers: &PromptLayers,
     tools: &[ToolDefinition],
 ) -> CompiledPrompt {
+    compile_with_tool_outputs(events, layers, tools, &BTreeMap::new())
+}
+
+/// Compiles history while resolving durable tool artifact bodies supplied by the
+/// caller. The compiler remains deterministic and performs no storage I/O.
+pub fn compile_with_tool_outputs(
+    events: &[EventEnvelope],
+    layers: &PromptLayers,
+    tools: &[ToolDefinition],
+    artifact_contents: &BTreeMap<String, String>,
+) -> CompiledPrompt {
     let stable_prefix = stable_prefix(layers, tools);
     let mut messages = Vec::new();
     let mut dynamic_tail = Vec::new();
@@ -89,23 +101,41 @@ pub fn compile(
                 "assistant",
                 format!("[tool proposed: {tool_name}] {}", intent_summary(intent)),
             ),
-            EventPayload::ToolFinished { result, .. } => push_message(
-                &mut messages,
-                &mut dynamic_tail,
-                "tool",
-                format!(
-                    "[tool result: {:?}]\nstdout_digest: {} ({} bytes)\nstderr_digest: {} ({} bytes)",
+            EventPayload::ToolFinished {
+                operation_id,
+                result,
+            } => {
+                let mut content = format!(
+                    "[tool result for operation {operation_id}: {:?}]\nstdout_digest: {} ({} bytes)\nstderr_digest: {} ({} bytes)",
                     result.status,
                     result.stdout_digest,
                     result.stdout_bytes,
                     result.stderr_digest,
                     result.stderr_bytes
-                ),
-            ),
+                );
+                if let Some(artifact_id) = result.stdout_artifact_id.as_ref() {
+                    if let Some(stdout) = artifact_contents.get(artifact_id) {
+                        content.push_str("\nstdout:\n");
+                        content.push_str(stdout);
+                    }
+                }
+                if let Some(artifact_id) = result.stderr_artifact_id.as_ref() {
+                    if let Some(stderr) = artifact_contents.get(artifact_id) {
+                        content.push_str("\nstderr:\n");
+                        content.push_str(stderr);
+                    }
+                }
+                if result.output_truncated {
+                    content.push_str("\n[tool output truncated]");
+                }
+                // A user role avoids emitting an invalid role=tool message without
+                // a provider-specific tool_call_id in OpenAI/Anthropic adapters.
+                push_message(&mut messages, &mut dynamic_tail, "user", content);
+            }
             EventPayload::ToolFailed { error_code, message, .. } => push_message(
                 &mut messages,
                 &mut dynamic_tail,
-                "tool",
+                "user",
                 format!("[tool failure: {error_code}] {message}"),
             ),
             EventPayload::ContextCompacted { summary, .. } => {

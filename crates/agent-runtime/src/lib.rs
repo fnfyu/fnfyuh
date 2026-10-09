@@ -8,14 +8,18 @@ use harness_execution_broker::{
     audit_result, ApprovalGrant, BackendOperation, BrokerError, ExecutionBroker,
     ExecutionContext,
 };
-use harness_prompt_compiler::{compile, CompiledPrompt, PromptLayers, ToolDefinition};
+use harness_prompt_compiler::{
+    compile_with_tool_outputs, CompiledPrompt, PromptLayers, ToolDefinition,
+};
 use harness_protocol::{BackendOperationState, EventPayload, ModelParameters, ToolIntent, ToolResult};
 use harness_session_engine::{ArtifactInput, OperationStatus, SessionEngine, SessionError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::Digest;
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -27,6 +31,8 @@ pub enum AgentError {
     Session(#[from] SessionError),
     #[error("model provider error: {0}")]
     Model(String),
+    #[error("turn was stopped")]
+    Stopped,
     #[error("execution broker error: {0}")]
     Broker(#[from] BrokerError),
     #[error("approval is required for operation `{0}`")]
@@ -94,14 +100,104 @@ impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
     }
 }
 
+/// Shared by the daemon input reader and the serial runtime owner. A stop request
+/// remains pending until the owner records the terminal state; no reader writes SQLite.
+#[derive(Debug, Default)]
+pub struct TurnCancellation {
+    state: Mutex<TurnCancellationState>,
+}
+
+#[derive(Debug, Default)]
+struct TurnCancellationState {
+    active: Option<(String, String, Option<String>)>,
+    requested: bool,
+}
+
+impl TurnCancellation {
+    pub fn activate(&self, session_id: &str, turn_id: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.active = Some((session_id.into(), turn_id.into(), None));
+        state.requested = false;
+    }
+
+    pub fn set_run_id(&self, run_id: &str) {
+        let mut state = self.state.lock().unwrap();
+        if let Some((_, _, active_run_id)) = &mut state.active {
+            *active_run_id = Some(run_id.into());
+        }
+    }
+
+    /// Returns whether cancellation was accepted for the currently active run.
+    /// A matching stop with no run id can be accepted before the run is created.
+    pub fn request(&self, session_id: &str, turn_id: &str, run_id: Option<&str>) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.active.as_ref().is_some_and(|(session, turn, run)| {
+            session == session_id && turn == turn_id &&
+                run_id.is_none_or(|requested| run.as_deref() == Some(requested))
+        }) {
+            state.requested = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn is_requested(&self) -> bool {
+        self.state.lock().unwrap().requested
+    }
+
+    pub fn clear(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.active = None;
+        state.requested = false;
+    }
+}
+
 pub struct AgentRuntime<M> {
     model: Arc<M>,
     sessions: SessionEngine,
     prompt_layers: PromptLayers,
     tools: Vec<ToolDefinition>,
+    cancellation: Option<Arc<TurnCancellation>>,
 }
 
 impl<M: ModelProvider> AgentRuntime<M> {
+    fn compile_prompt(&self, session_id: &str, events: &[harness_protocol::EventEnvelope]) -> Result<CompiledPrompt, AgentError> {
+        let mut artifacts = BTreeMap::new();
+        for event in events {
+            if let EventPayload::ToolFinished { result, .. } = &event.payload {
+                for artifact_id in [result.stdout_artifact_id.as_ref(), result.stderr_artifact_id.as_ref()].into_iter().flatten() {
+                    if let Some(artifact) = self.sessions.get_artifact(session_id, artifact_id)? {
+                        artifacts.insert(artifact_id.clone(), bounded_tool_output(&artifact.content, 32 * 1024));
+                    }
+                }
+            }
+        }
+        let mut prompt = compile_with_tool_outputs(events, &self.prompt_layers, &self.tools, &artifacts);
+        const MAX_CONTEXT_BYTES: usize = 192 * 1024;
+        let mut bytes: usize = prompt.messages.iter().map(|message| message.content.len()).sum();
+        if bytes > MAX_CONTEXT_BYTES {
+            // Keep the stable project rules and recent messages; show an honest
+            // omission marker instead of pretending to summarize unseen history.
+            let keep_system = usize::from(prompt.messages.first().is_some_and(|message| message.role == "system"));
+            let mut start = keep_system;
+            while bytes > MAX_CONTEXT_BYTES && start + 1 < prompt.messages.len() {
+                bytes -= prompt.messages[start].content.len();
+                start += 1;
+            }
+            let recent = prompt.messages.drain(start..).collect::<Vec<_>>();
+            prompt.messages.truncate(keep_system);
+            prompt.messages.push(harness_prompt_compiler::ModelMessage {
+                role: "user".into(), content: "[Earlier session messages omitted to fit context; inspect workspace or artifacts if needed.]".into(),
+            });
+            prompt.messages.extend(recent);
+            prompt.dynamic_tail = prompt.messages.iter().skip(keep_system).cloned().collect();
+            let digest = sha2::Sha256::digest(harness_protocol::canonical_json(&prompt.messages).map_err(|error| AgentError::Model(error.to_string()))?.as_bytes());
+            prompt.digest = format!("sha256:{digest:x}");
+        }
+        Ok(prompt)
+    }
+
     pub fn new(
         model: Arc<M>,
         sessions: SessionEngine,
@@ -113,7 +209,29 @@ impl<M: ModelProvider> AgentRuntime<M> {
             sessions,
             prompt_layers,
             tools,
+            cancellation: None,
         }
+    }
+
+    pub fn with_cancellation(mut self, cancellation: Arc<TurnCancellation>) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    /// Only the serial runtime owner records terminal events; the input reader
+    /// merely signals a request and never races an SQLite write against execution.
+    pub fn check_stopped(&self, session_id: &str, turn_id: &str, run_id: &str) -> Result<(), AgentError> {
+        if self.cancellation.as_ref().is_some_and(|cancellation| cancellation.is_requested()) {
+            self.sessions.append(session_id, EventPayload::RecoveryRequired {
+                operation_id: None,
+                reason: "turn stopped by user; in-flight model or tool completion was discarded".into(),
+            }, Some(turn_id.into()), None)?;
+            self.sessions.append(session_id, EventPayload::RunCompleted {
+                run_id: run_id.into(), success: false,
+            }, Some(turn_id.into()), None)?;
+            return Err(AgentError::Stopped);
+        }
+        Ok(())
     }
 
     pub fn run_turn(
@@ -130,6 +248,9 @@ impl<M: ModelProvider> AgentRuntime<M> {
             .map_err(|error| AgentError::Model(format!("invalid model parameters: {error}")))?;
         let turn_id = turn_id.into();
         let run_id = Uuid::new_v4().to_string();
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.set_run_id(&run_id);
+        }
         let user_text = user_text.into();
         let model_name = model_name.into();
         self.sessions.append(
@@ -160,8 +281,9 @@ impl<M: ModelProvider> AgentRuntime<M> {
             None,
         )?;
 
+        self.check_stopped(session_id, &turn_id, &run_id)?;
         let history = self.sessions.effective_events(session_id)?;
-        let prompt = compile(&history, &self.prompt_layers, &self.tools);
+        let prompt = self.compile_prompt(session_id, &history)?;
         let prompt_digest = prompt.digest.clone();
         let request_id = Uuid::new_v4().to_string();
         self.sessions.append(
@@ -178,6 +300,7 @@ impl<M: ModelProvider> AgentRuntime<M> {
             None,
         )?;
 
+        self.check_stopped(session_id, &turn_id, &run_id)?;
         let mut response = match self.model.complete(ModelRequest {
             session_id: session_id.to_string(),
             turn_id: turn_id.clone(),
@@ -212,6 +335,7 @@ impl<M: ModelProvider> AgentRuntime<M> {
                 return Err(error);
             }
         };
+        self.check_stopped(session_id, &turn_id, &run_id)?;
         response.request_id = request_id.clone();
         self.sessions.append(
             session_id,
@@ -253,6 +377,7 @@ impl<M: ModelProvider> AgentRuntime<M> {
             }
         }
         for tool in &mut response.tools {
+            self.check_stopped(session_id, &turn_id, &run_id)?;
             let operation_id = tool
                 .operation_id
                 .clone()
@@ -272,6 +397,7 @@ impl<M: ModelProvider> AgentRuntime<M> {
             )?;
         }
         if response.tools.is_empty() {
+            self.check_stopped(session_id, &turn_id, &run_id)?;
             self.sessions.append(
                 session_id,
                 EventPayload::RunCompleted {
@@ -284,6 +410,204 @@ impl<M: ModelProvider> AgentRuntime<M> {
         }
         Ok(response)
     }
+
+    /// Continues the existing turn/run after its proposed tools have reached a
+    /// terminal state. It reuses the latest request's model parameters
+    /// and does not emit turn, user-message, or run-start events again.
+    pub fn continue_run(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        run_id: &str,
+    ) -> Result<ModelResponse, AgentError> {
+        self.check_stopped(session_id, turn_id, run_id)?;
+        let events = self.sessions.effective_events(session_id)?;
+        let projection = self.sessions.replay(session_id)?;
+        let turn = projection.turns.get(turn_id).ok_or_else(|| {
+            SessionError::InvalidState(format!("turn `{turn_id}` does not exist"))
+        })?;
+        if turn.run_id != run_id || turn.status != "running" {
+            return Err(SessionError::InvalidState(
+                "continuation requires the active matching turn/run".to_string(),
+            )
+            .into());
+        }
+        let run_operations = projection
+            .operations
+            .values()
+            .filter(|operation| operation.run_id == run_id)
+            .collect::<Vec<_>>();
+        if run_operations.iter().any(|operation| !operation.is_terminal()) {
+            return Err(SessionError::InvalidState(
+                "continuation requires all run operations to be terminal".to_string(),
+            )
+            .into());
+        }
+        if events.iter().filter(|event| matches!(&event.payload,
+            EventPayload::ModelRequested { run_id: requested_run, .. } if requested_run == run_id
+        )).count() >= 32 {
+            self.sessions.append(session_id, EventPayload::RunCompleted {
+                run_id: run_id.to_string(), success: false,
+            }, Some(turn_id.to_string()), None)?;
+            return Err(AgentError::Model("run reached the 32 model-step limit".into()));
+        }
+        let (model_name, parameters) = events
+            .iter()
+            .rev()
+            .find_map(|event| match &event.payload {
+                EventPayload::ModelRequested {
+                    turn_id: event_turn,
+                    run_id: event_run,
+                    model,
+                    parameters,
+                    ..
+                } if event_turn == turn_id && event_run == run_id => {
+                    Some((model.clone(), parameters.clone()))
+                }
+                _ => None,
+            })
+            .ok_or_else(|| {
+                SessionError::InvalidState(
+                    "run has no prior model request to continue".to_string(),
+                )
+            })?;
+
+        let prompt = self.compile_prompt(session_id, &events)?;
+        let request_id = Uuid::new_v4().to_string();
+        self.sessions.append(
+            session_id,
+            EventPayload::ModelRequested {
+                turn_id: turn_id.to_string(),
+                run_id: run_id.to_string(),
+                request_id: request_id.clone(),
+                model: model_name.clone(),
+                prompt_digest: prompt.digest.clone(),
+                parameters: parameters.clone(),
+            },
+            Some(turn_id.to_string()),
+            None,
+        )?;
+        self.check_stopped(session_id, turn_id, run_id)?;
+        let mut response = match self.model.complete(ModelRequest {
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
+            run_id: run_id.to_string(),
+            request_id: request_id.clone(),
+            model: model_name,
+            prompt,
+            tools: self.tools.clone(),
+            attachments: Vec::new(),
+            parameters,
+        }) {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = self.sessions.append(
+                    session_id,
+                    EventPayload::RecoveryRequired {
+                        operation_id: None,
+                        reason: error.to_string(),
+                    },
+                    Some(turn_id.to_string()),
+                    Some(request_id.clone()),
+                );
+                let _ = self.sessions.append(
+                    session_id,
+                    EventPayload::RunCompleted {
+                        run_id: run_id.to_string(),
+                        success: false,
+                    },
+                    Some(turn_id.to_string()),
+                    None,
+                );
+                return Err(error);
+            }
+        };
+        self.check_stopped(session_id, &turn_id, &run_id)?;
+        response.request_id = request_id.clone();
+        self.sessions.append(
+            session_id,
+            EventPayload::ModelResponded {
+                turn_id: turn_id.to_string(),
+                run_id: run_id.to_string(),
+                request_id: request_id.clone(),
+                content: response.content.clone(),
+                stop_reason: response.stop_reason.clone(),
+            },
+            Some(turn_id.to_string()),
+            None,
+        )?;
+        let provider_tool_calls = std::mem::take(&mut response.tool_calls);
+        for call in provider_tool_calls {
+            match parse_tool_call(call) {
+                Ok(tool) => response.tools.push(tool),
+                Err(error) => {
+                    let _ = self.sessions.append(
+                        session_id,
+                        EventPayload::RecoveryRequired {
+                            operation_id: None,
+                            reason: error.to_string(),
+                        },
+                        Some(turn_id.to_string()),
+                        Some(request_id.clone()),
+                    );
+                    let _ = self.sessions.append(
+                        session_id,
+                        EventPayload::RunCompleted {
+                            run_id: run_id.to_string(),
+                            success: false,
+                        },
+                        Some(turn_id.to_string()),
+                        None,
+                    );
+                    return Err(error);
+                }
+            }
+        }
+        for tool in &mut response.tools {
+            self.check_stopped(session_id, &turn_id, &run_id)?;
+            let operation_id = tool
+                .operation_id
+                .clone()
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            tool.operation_id = Some(operation_id.clone());
+            self.sessions.append(
+                session_id,
+                EventPayload::ToolProposed {
+                    turn_id: turn_id.to_string(),
+                    run_id: run_id.to_string(),
+                    operation_id,
+                    tool_name: tool.tool_name.clone(),
+                    intent: tool.intent.clone(),
+                },
+                Some(turn_id.to_string()),
+                Some(request_id.clone()),
+            )?;
+        }
+        if response.tools.is_empty() {
+            self.check_stopped(session_id, &turn_id, &run_id)?;
+            self.sessions.append(
+                session_id,
+                EventPayload::RunCompleted {
+                    run_id: run_id.to_string(),
+                    success: true,
+                },
+                Some(turn_id.to_string()),
+                None,
+            )?;
+        }
+        Ok(response)
+    }
+}
+
+fn bounded_tool_output(content: &str, max_bytes: usize) -> String {
+    if content.len() <= max_bytes {
+        return content.to_string();
+    }
+    let mut end = max_bytes;
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n[truncated: tool output exceeded {max_bytes} bytes]", &content[..end])
 }
 
 fn required_string(arguments: &Value, key: &str) -> Result<String, AgentError> {
@@ -432,14 +756,8 @@ impl ToolCoordinator {
             artifacts.retain(|artifact| artifact.kind != "stdout");
             artifacts.push(artifact);
         }
-        let projection = self.sessions.replay(session_id)?;
-        let has_correlated_turn = projection.turns.values().any(|turn| turn.run_id == run_id);
-        let complete_run = has_correlated_turn
-            && !projection.operations.values().any(|operation| {
-                operation.operation_id != operation_id
-                    && operation.run_id == run_id
-                    && !operation.is_terminal()
-            });
+        // A successful final tool is not the end of the run: the model must see
+        // its durable artifact body and decide whether to answer or propose tools.
         self.sessions.finish_operation(
             session_id,
             operation_id,
@@ -447,7 +765,7 @@ impl ToolCoordinator {
             run_id,
             audit_result(result),
             artifacts,
-            complete_run,
+            false,
         )?;
         Ok(())
     }
@@ -1659,6 +1977,212 @@ impl ModelProvider for AnthropicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_protocol::{PolicyOutcome, ToolAuditResult, ToolStatus};
+    use harness_session_engine::SqliteEventStore;
+    use std::sync::Mutex;
+
+    struct ContinuationProvider {
+        requests: Mutex<Vec<ModelRequest>>,
+    }
+
+    impl ModelProvider for ContinuationProvider {
+        fn complete(&self, request: ModelRequest) -> Result<ModelResponse, AgentError> {
+            let mut requests = self.requests.lock().unwrap();
+            let response = if requests.is_empty() {
+                ModelResponse {
+                    request_id: String::new(),
+                    content: "I will read the file.".into(),
+                    stop_reason: Some("tool_use".into()),
+                    tools: vec![ProposedTool {
+                        operation_id: Some("read-operation".into()),
+                        tool_name: "read_file".into(),
+                        intent: ToolIntent::ReadFile { path: "known.txt".into() },
+                    }],
+                    tool_calls: Vec::new(),
+                }
+            } else {
+                assert_eq!(request.model, "test-model");
+                assert_eq!(request.parameters.temperature, Some(0.25));
+                assert!(request.prompt.messages.iter().any(|message| {
+                    message.role == "user"
+                        && message.content.contains("KNOWN TOOL CONTENT")
+                        && message.content.contains("stdout")
+                }));
+                ModelResponse {
+                    request_id: String::new(),
+                    content: "The final answer uses KNOWN TOOL CONTENT.".into(),
+                    stop_reason: Some("stop".into()),
+                    tools: Vec::new(),
+                    tool_calls: Vec::new(),
+                }
+            };
+            requests.push(request);
+            Ok(response)
+        }
+    }
+
+    #[test]
+    fn public_runtime_continues_same_run_with_tool_artifact_content() {
+        let sessions = SessionEngine::new(SqliteEventStore::in_memory().unwrap());
+        let (session_id, _) = sessions.create_session(vec![".".into()], None).unwrap();
+        let provider = Arc::new(ContinuationProvider { requests: Mutex::new(Vec::new()) });
+        let runtime = AgentRuntime::new(
+            provider.clone(),
+            sessions.clone(),
+            PromptLayers::default(),
+            vec![],
+        );
+        let first = runtime
+            .run_turn(
+                &session_id,
+                "turn-1",
+                "Read known.txt",
+                "test-model",
+                Vec::new(),
+                ModelParameters {
+                    temperature: Some(0.25),
+                    ..ModelParameters::default()
+                },
+            )
+            .unwrap();
+        let operation_id = first.tools[0].operation_id.clone().unwrap();
+        let run_id = sessions.replay(&session_id).unwrap().turns["turn-1"].run_id.clone();
+        sessions
+            .append(
+                &session_id,
+                EventPayload::PolicyEvaluated {
+                    operation_id: operation_id.clone(),
+                    request_digest: "digest".into(),
+                    policy_version: "test".into(),
+                    outcome: PolicyOutcome::Allowed,
+                    reason: "test".into(),
+                },
+                Some("turn-1".into()),
+                None,
+            )
+            .unwrap();
+        sessions
+            .append(
+                &session_id,
+                EventPayload::ExecutionRequested {
+                    operation_id: operation_id.clone(),
+                    request_digest: "digest".into(),
+                    backend: "test".into(),
+                    external_id: None,
+                },
+                Some("turn-1".into()),
+                None,
+            )
+            .unwrap();
+        sessions
+            .append(
+                &session_id,
+                EventPayload::ToolStarted {
+                    operation_id: operation_id.clone(),
+                    backend: "test".into(),
+                    external_id: None,
+                },
+                Some("turn-1".into()),
+                None,
+            )
+            .unwrap();
+        sessions
+            .finish_operation(
+                &session_id,
+                &operation_id,
+                "turn-1",
+                &run_id,
+                ToolAuditResult {
+                    status: ToolStatus::Succeeded,
+                    exit_code: Some(0),
+                    stdout_digest: "sha256:test".into(),
+                    stderr_digest: "sha256:empty".into(),
+                    stdout_bytes: 18,
+                    stderr_bytes: 0,
+                    bytes_written: None,
+                    output_truncated: false,
+                    duration_ms: 1,
+                    stdout_artifact_id: None,
+                    stderr_artifact_id: None,
+                },
+                vec![ArtifactInput {
+                    kind: "stdout".into(),
+                    content: "KNOWN TOOL CONTENT".into(),
+                    media_type: "text/plain; charset=utf-8".into(),
+                }],
+                false,
+            )
+            .unwrap();
+
+        let response = runtime.continue_run(&session_id, "turn-1", &run_id).unwrap();
+        assert_eq!(response.content, "The final answer uses KNOWN TOOL CONTENT.");
+        let events = sessions.effective_events(&session_id).unwrap();
+        assert_eq!(events.iter().filter(|event| matches!(event.payload, EventPayload::TurnStarted { .. })).count(), 1);
+        assert_eq!(events.iter().filter(|event| matches!(event.payload, EventPayload::UserMessage { .. })).count(), 1);
+        assert_eq!(events.iter().filter(|event| matches!(event.payload, EventPayload::RunStarted { .. })).count(), 1);
+        assert_eq!(events.iter().filter(|event| matches!(event.payload, EventPayload::ModelRequested { .. })).count(), 2);
+        assert!(matches!(events.last().unwrap().payload, EventPayload::RunCompleted { success: true, .. }));
+    }
+
+    #[test]
+    fn coding_turn_can_read_edit_fail_test_fix_and_answer_from_real_artifacts() {
+        use harness_policy_engine::{PolicyConfig, PolicyEngine};
+        use std::fs;
+        use tempfile::tempdir;
+
+        struct CodingProvider(Mutex<usize>);
+        impl ModelProvider for CodingProvider {
+            fn complete(&self, request: ModelRequest) -> Result<ModelResponse, AgentError> {
+                let mut step = self.0.lock().unwrap();
+                let context = request.prompt.messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>().join("\n");
+                let (name, intent) = match *step {
+                    0 => ("read_file", Some(ToolIntent::ReadFile { path: "answer.py".into() })),
+                    1 => {
+                        assert!(context.contains("print('old')"));
+                        ("edit_file", Some(ToolIntent::EditFile { path: "answer.py".into(), old_text: "old".into(), new_text: "broken".into(), expected_sha256: None }))
+                    }
+                    2 => ("test", Some(ToolIntent::Test { program: "/usr/bin/python3".into(), args: vec!["-c".into(), "import pathlib; assert pathlib.Path('answer.py').read_text() == \"print('fixed')\\n\", 'expected fixed'".into()], cwd: None, timeout_ms: Some(10_000) })),
+                    3 => {
+                        assert!(context.contains("expected fixed"), "model must see failed test stderr: {context}");
+                        ("edit_file", Some(ToolIntent::EditFile { path: "answer.py".into(), old_text: "broken".into(), new_text: "fixed".into(), expected_sha256: None }))
+                    }
+                    4 => ("test", Some(ToolIntent::Test { program: "/usr/bin/python3".into(), args: vec!["-c".into(), "import pathlib; assert pathlib.Path('answer.py').read_text() == \"print('fixed')\\n\"; print('PASS')".into()], cwd: None, timeout_ms: Some(10_000) })),
+                    5 => { assert!(context.contains("PASS")); ("final", None) }
+                    6 => { assert!(context.contains("PASS"), "a new turn must restore persisted tool artifact bodies"); ("final", None) }
+                    _ => panic!("unexpected model request"),
+                };
+                *step += 1;
+                Ok(ModelResponse { request_id: request.request_id, content: if intent.is_some() { "working".into() } else { "Fixed and tested.".into() }, stop_reason: None, tools: intent.map(|intent| vec![ProposedTool { operation_id: None, tool_name: name.into(), intent }]).unwrap_or_default(), tool_calls: Vec::new() })
+            }
+        }
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("answer.py"), "print('old')\n").unwrap();
+        let sessions = SessionEngine::new(SqliteEventStore::in_memory().unwrap());
+        let (session_id, _) = sessions.create_session(vec![directory.path().display().to_string()], None).unwrap();
+        let provider = Arc::new(CodingProvider(Mutex::new(0)));
+        let runtime = AgentRuntime::new(provider.clone(), sessions.clone(), PromptLayers::default(), vec![]);
+        let mut policy = PolicyConfig::trusted_workspace(vec![directory.path().to_path_buf()]);
+        policy.allow_trusted_host_process = true;
+        policy.allowed_programs.insert("/usr/bin/python3".into());
+        let coordinator = ToolCoordinator::new(sessions.clone(), ExecutionBroker::new(PolicyEngine::new(policy).unwrap()));
+        let mut response = runtime.run_turn(&session_id, "turn-1", "Fix answer.py", "fake", vec![], ModelParameters::default()).unwrap();
+        let run_id = sessions.replay(&session_id).unwrap().turns["turn-1"].run_id.clone();
+        for step in 0..5 {
+            let proposal = &response.tools[0];
+            let operation_id = proposal.operation_id.as_ref().unwrap();
+            let grant = if proposal.intent.is_read_only() { None } else {
+                let prepared = coordinator.broker.prepare(ExecutionContext { session_id: session_id.clone(), principal: "user".into(), backend: "local-trusted-host".into(), workspace_roots: vec![directory.path().display().to_string()] }, operation_id.clone(), proposal.intent.clone()).unwrap();
+                Some(ApprovalGrant { session_id: session_id.clone(), operation_id: operation_id.clone(), request_digest: prepared.request_digest().into(), principal: "user".into(), actor: "user".into(), nonce: Uuid::new_v4().to_string(), expires_at_ms: harness_protocol::now_ms() + 60_000 })
+            };
+            let result = coordinator.execute(&session_id, "turn-1", &run_id, "user", operation_id, &proposal.tool_name, proposal.intent.clone(), grant).unwrap();
+            if step == 2 { assert_eq!(result.status, ToolStatus::Failed); }
+            response = runtime.continue_run(&session_id, "turn-1", &run_id).unwrap();
+        }
+        assert_eq!(response.content, "Fixed and tested.");
+        assert_eq!(fs::read_to_string(directory.path().join("answer.py")).unwrap(), "print('fixed')\n");
+        assert!(matches!(sessions.effective_events(&session_id).unwrap().last().unwrap().payload, EventPayload::RunCompleted { success: true, .. }));
+        runtime.run_turn(&session_id, "turn-2", "What happened?", "fake", vec![], ModelParameters::default()).unwrap();
+    }
 
     #[test]
     fn anthropic_request_uses_messages_shape_without_credentials() {
